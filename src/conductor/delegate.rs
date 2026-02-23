@@ -16,9 +16,9 @@ pub struct WorkerInfo {
 
 /// Build SubAgentTools from the `[agent.workers.*]` config sections.
 ///
-/// Returns a list of (SubAgentTool, WorkerInfo) pairs. The SubAgentTool should
-/// be registered on the Agent via `agent.with_sub_agent(sub)`. Each worker gets
-/// the specified tools (or a default set).
+/// Returns a list of (SubAgentTool, WorkerInfo) pairs. Each SubAgentTool should
+/// be wrapped with `SecureToolWrapper` and added to the agent's tool list so
+/// that worker delegations are audit-logged and security-checked.
 pub fn build_workers(
     config: &Config,
     tools: &[Arc<dyn AgentTool>],
