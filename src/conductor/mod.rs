@@ -59,8 +59,8 @@ impl Conductor {
 
         // 4. Wrap with security
         let session_id_ref = Arc::new(std::sync::RwLock::new(String::new()));
-        let wrapped_tools =
-            security::wrap_tools(tool_list, policy, db.clone(), session_id_ref.clone());
+        let mut wrapped_tools =
+            security::wrap_tools(tool_list, policy.clone(), db.clone(), session_id_ref.clone());
 
         // 5. Build budget tracker
         let budget = BudgetTracker::new(
@@ -71,11 +71,21 @@ impl Conductor {
         budget.load_from_db().await?;
 
         // 6. Build worker sub-agents from config
-        // Workers get Arc'd copies of the base tools (without security wrapping —
-        // the parent agent's security wrapper handles enforcement)
+        // Workers get security-wrapped tools so their internal tool calls are
+        // audit-logged and policy-checked (Gap 2 fix)
         let worker_tools: Vec<Arc<dyn AgentTool>> = vec![
-            Arc::new(tools::MemorySearchTool::new(db.clone())),
-            Arc::new(tools::MemoryStoreTool::new(db.clone())),
+            Arc::new(security::SecureToolWrapper {
+                inner: Box::new(tools::MemorySearchTool::new(db.clone())),
+                policy: policy.clone(),
+                db: db.clone(),
+                session_id: session_id_ref.clone(),
+            }),
+            Arc::new(security::SecureToolWrapper {
+                inner: Box::new(tools::MemoryStoreTool::new(db.clone())),
+                policy: policy.clone(),
+                db: db.clone(),
+                session_id: session_id_ref.clone(),
+            }),
         ];
         let workers = delegate::build_workers(config, &worker_tools);
         let worker_infos: Vec<WorkerInfo> = workers.iter().map(|(_, info)| info.clone()).collect();
@@ -84,10 +94,21 @@ impl Conductor {
             tracing::info!("Configured {} worker(s)", worker_infos.len());
         }
 
+        // Wrap each SubAgentTool with SecureToolWrapper so worker delegations
+        // are audit-logged and security-checked (Gap 1 fix)
+        for (sub_agent, _info) in workers {
+            wrapped_tools.push(Box::new(security::SecureToolWrapper {
+                inner: Box::new(sub_agent),
+                policy: policy.clone(),
+                db: db.clone(),
+                session_id: session_id_ref.clone(),
+            }));
+        }
+
         // 7. Resolve provider
         let provider = resolve_provider(&config.agent.provider);
 
-        // 8. Build agent
+        // 8. Build agent — workers are included in wrapped_tools, no with_sub_agent needed
         let budget_check = budget.clone();
         let budget_record = budget.clone();
         let mut agent = Agent::new(provider)
@@ -100,11 +121,6 @@ impl Conductor {
                 budget_record.record_usage(usage.input, usage.output);
                 budget_record.record_turn();
             });
-
-        // Register worker sub-agents
-        for (sub_agent, _info) in workers {
-            agent = agent.with_sub_agent(sub_agent);
-        }
 
         if let Some(max_tokens) = config.agent.max_tokens {
             agent = agent.with_max_tokens(max_tokens);
