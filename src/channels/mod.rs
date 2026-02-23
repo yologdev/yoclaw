@@ -52,7 +52,11 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut start = 0;
     while start < text.len() {
-        let end = (start + max_len).min(text.len());
+        let mut end = (start + max_len).min(text.len());
+        // Ensure we don't split in the middle of a UTF-8 character
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
         let split_at = if end < text.len() {
             // Try to split at a newline
             text[start..end]
@@ -85,6 +89,15 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0], "line1\nline2\n");
         assert_eq!(chunks[1], "line3\nline4");
+    }
+
+    #[test]
+    fn test_split_multibyte_chars() {
+        // Each emoji is 4 bytes; this tests that we don't panic on multi-byte boundaries
+        let text = "Hello 🌍🌎🌏 World";
+        let chunks = split_message(text, 10);
+        assert!(chunks.len() >= 2);
+        assert_eq!(chunks.join(""), text);
     }
 
     #[test]

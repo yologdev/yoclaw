@@ -29,6 +29,13 @@ pub async fn check_and_run_due_jobs(
     let mut ran = 0;
 
     for job in jobs {
+        if job.session_mode != "isolated" {
+            tracing::warn!(
+                "Cron job '{}' has session_mode '{}' which is not yet implemented; running in isolated mode",
+                job.name,
+                job.session_mode
+            );
+        }
         tracing::info!("Cron job '{}' is due, executing...", job.name);
 
         let started_at = now_ms() as i64;

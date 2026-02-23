@@ -7,7 +7,7 @@ use crate::security::budget::BudgetTracker;
 use crate::security::{self, SecurityPolicy};
 use crate::skills::LoadedSkill;
 use delegate::WorkerInfo;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
 use std::sync::Arc;
 use yoagent::provider::AnthropicProvider;
 use yoagent::types::*;
@@ -22,9 +22,8 @@ pub struct Conductor {
     budget: BudgetTracker,
     loaded_skills: Vec<LoadedSkill>,
     worker_infos: Vec<WorkerInfo>,
-    /// Turns since last periodic tape save. Saves every 5 turns to preserve
-    /// context before compaction discards older messages.
-    turns_since_save: Arc<AtomicUsize>,
+    /// Worker sub-agent tools for direct delegation (bypassing main agent).
+    direct_workers: HashMap<String, Box<dyn AgentTool>>,
 }
 
 impl Conductor {
@@ -105,6 +104,21 @@ impl Conductor {
             tracing::info!("Configured {} worker(s)", worker_infos.len());
         }
 
+        // Build a second set of workers for direct delegation (bypassing main agent)
+        let direct_workers_raw = delegate::build_workers(config, &worker_tools);
+        let mut direct_workers: HashMap<String, Box<dyn AgentTool>> = HashMap::new();
+        for (sub_agent, info) in direct_workers_raw {
+            direct_workers.insert(
+                info.name.clone(),
+                Box::new(security::SecureToolWrapper {
+                    inner: Box::new(sub_agent),
+                    policy: policy.clone(),
+                    db: db.clone(),
+                    session_id: session_id_ref.clone(),
+                }),
+            );
+        }
+
         // Wrap each SubAgentTool with SecureToolWrapper so worker delegations
         // are audit-logged and security-checked (Gap 1 fix)
         for (sub_agent, _info) in workers {
@@ -120,10 +134,8 @@ impl Conductor {
         let provider = resolve_provider(&config.agent.provider);
 
         // 8. Build agent — workers are included in wrapped_tools, no with_sub_agent needed
-        let turns_since_save = Arc::new(AtomicUsize::new(0));
         let budget_check = budget.clone();
         let budget_record = budget.clone();
-        let turns_counter = turns_since_save.clone();
         let mut agent = Agent::new(provider)
             .with_system_prompt(&persona)
             .with_model(&config.agent.model)
@@ -133,7 +145,6 @@ impl Conductor {
             .on_after_turn(move |_messages, usage| {
                 budget_record.record_usage(usage.input, usage.output);
                 budget_record.record_turn();
-                turns_counter.fetch_add(1, Ordering::Relaxed);
             });
 
         // 8a. Wire up context management from config
@@ -179,7 +190,7 @@ impl Conductor {
             budget,
             loaded_skills,
             worker_infos,
-            turns_since_save,
+            direct_workers,
         })
     }
 
@@ -213,9 +224,6 @@ impl Conductor {
         // Persist conversation state
         let messages = self.agent.messages();
         self.db.tape_save_messages(session_id, messages).await?;
-
-        // Reset periodic save counter (we just saved)
-        self.turns_since_save.store(0, Ordering::Relaxed);
 
         Ok(response)
     }
@@ -257,7 +265,7 @@ impl Conductor {
         &self.current_session
     }
 
-    /// Delegate a message directly to a named worker, bypassing the main conductor agent.
+    /// Delegate a message directly to a named worker's sub-agent, bypassing the main conductor.
     /// Used for channel routing (e.g., Discord channel → specific worker).
     pub async fn delegate_to_worker(
         &mut self,
@@ -265,24 +273,64 @@ impl Conductor {
         worker_name: &str,
         text: &str,
     ) -> Result<String, anyhow::Error> {
-        // Find the worker info by name
-        let _worker = self
-            .worker_infos
-            .iter()
-            .find(|w| w.name == worker_name)
-            .ok_or_else(|| anyhow::anyhow!("Worker '{}' not found", worker_name))?;
+        if !self.direct_workers.contains_key(worker_name) {
+            anyhow::bail!("Worker '{}' not found", worker_name);
+        }
 
         tracing::info!(
-            "Routing to worker '{}' for session {}",
+            "Delegating to worker '{}' for session {}",
             worker_name,
             session_id
         );
 
-        // Use the conductor's process_message with the worker's system prompt prepended.
-        // The worker hint is informational — the actual routing happens here by
-        // prefixing the message with worker context.
-        let prefixed = format!("[Routed to worker: {}]\n\n{}", worker_name, text);
-        self.process_message(session_id, &prefixed).await
+        // Update session_id reference for audit logging
+        *self.session_id_ref.write().unwrap() = session_id.to_string();
+
+        // Execute the worker's sub-agent directly
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let params = serde_json::json!({"task": text});
+        let worker_tool = self.direct_workers.get(worker_name).unwrap();
+        let result = worker_tool
+            .execute("direct-delegate", params, cancel, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Worker '{}' failed: {:?}", worker_name, e))?;
+
+        let response = result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Save current agent state if we're in this session
+        if self.current_session == session_id {
+            let messages = self.agent.messages();
+            self.db.tape_save_messages(session_id, messages).await?;
+        }
+
+        // Append the worker exchange to the session tape
+        let mut messages = self.db.tape_load_messages(session_id).await?;
+        messages.push(AgentMessage::Llm(Message::user(text)));
+        messages.push(AgentMessage::Llm(Message::Assistant {
+            content: vec![Content::Text {
+                text: response.clone(),
+            }],
+            stop_reason: StopReason::Stop,
+            model: format!("worker:{}", worker_name),
+            provider: "worker".to_string(),
+            usage: Usage::default(),
+            timestamp: crate::db::now_ms(),
+            error_message: None,
+        }));
+        self.db.tape_save_messages(session_id, &messages).await?;
+
+        // Invalidate current session so next process_message reloads from tape
+        self.current_session = String::new();
+
+        Ok(response)
     }
 }
 
@@ -364,7 +412,7 @@ api_key = "test-key"
             budget,
             loaded_skills: Vec::new(),
             worker_infos: Vec::new(),
-            turns_since_save: Arc::new(AtomicUsize::new(0)),
+            direct_workers: HashMap::new(),
         };
 
         (conductor, db)
@@ -401,7 +449,7 @@ api_key = "test-key"
             budget,
             loaded_skills: Vec::new(),
             worker_infos: Vec::new(),
-            turns_since_save: Arc::new(AtomicUsize::new(0)),
+            direct_workers: HashMap::new(),
         };
 
         // Send a message
