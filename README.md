@@ -2,6 +2,21 @@
   <img src="assets/banner.png" alt="yoclaw banner" width="100%">
 </p>
 
+<p align="center">
+  <a href="https://github.com/yologdev/yoclaw">GitHub</a> ·
+  <a href="https://deepwiki.com/yologdev/yoclaw">DeepWiki</a> ·
+  <a href="https://github.com/yologdev/yoclaw/issues">Issues</a> ·
+  <a href="https://github.com/yologdev/yoclaw/releases">Releases</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/yologdev/yoclaw/actions"><img src="https://img.shields.io/github/actions/workflow/status/yologdev/yoclaw/ci.yml?label=CI&logo=github" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="license MIT"></a>
+  <a href="https://github.com/yologdev/yoclaw/commits/master"><img src="https://img.shields.io/github/last-commit/yologdev/yoclaw" alt="last commit"></a>
+</p>
+
+---
+
 # yoclaw: Single-Binary AI Agent
 
 **yoclaw** is a minimal, secure alternative to [OpenClaw](https://github.com/anthropics/openclaw) — a single Rust binary that turns any LLM into a persistent, tool-using agent on messaging platforms. Built on [yoagent](https://github.com/yologdev/yoagent).
