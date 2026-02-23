@@ -54,7 +54,7 @@ impl Db {
 
     /// Atomically claim the next pending entry. Returns None if queue is empty.
     pub async fn queue_claim_next(&self) -> Result<Option<QueueEntry>, DbError> {
-        self.exec(|conn| queue_claim_sync(conn)).await
+        self.exec(queue_claim_sync).await
     }
 
     /// Mark an entry as done.

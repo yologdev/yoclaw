@@ -16,10 +16,7 @@ pub struct LoadedSkill {
 ///
 /// Returns a prompt fragment (XML) and the list of loaded skill manifests.
 /// The prompt fragment can be appended to the system prompt directly.
-pub fn load_filtered_skills(
-    dirs: &[&Path],
-    policy: &SecurityPolicy,
-) -> (String, Vec<LoadedSkill>) {
+pub fn load_filtered_skills(dirs: &[&Path], policy: &SecurityPolicy) -> (String, Vec<LoadedSkill>) {
     // Load all skills via yoagent to reuse its directory scanning + frontmatter parsing
     let all_skills = yoagent::SkillSet::load(dirs).unwrap_or_default();
 

@@ -7,6 +7,7 @@ use crate::security::budget::BudgetTracker;
 use crate::security::{self, SecurityPolicy};
 use crate::skills::LoadedSkill;
 use delegate::WorkerInfo;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use yoagent::provider::AnthropicProvider;
 use yoagent::types::*;
@@ -21,6 +22,9 @@ pub struct Conductor {
     budget: BudgetTracker,
     loaded_skills: Vec<LoadedSkill>,
     worker_infos: Vec<WorkerInfo>,
+    /// Turns since last periodic tape save. Saves every 5 turns to preserve
+    /// context before compaction discards older messages.
+    turns_since_save: Arc<AtomicUsize>,
 }
 
 impl Conductor {
@@ -56,11 +60,18 @@ impl Conductor {
         let mut tool_list: Vec<Box<dyn AgentTool>> = yoagent::tools::default_tools();
         tool_list.push(Box::new(tools::MemorySearchTool::new(db.clone())));
         tool_list.push(Box::new(tools::MemoryStoreTool::new(db.clone())));
+        tool_list.push(Box::new(crate::scheduler::tools::CronScheduleTool::new(
+            db.clone(),
+        )));
 
         // 4. Wrap with security
         let session_id_ref = Arc::new(std::sync::RwLock::new(String::new()));
-        let mut wrapped_tools =
-            security::wrap_tools(tool_list, policy.clone(), db.clone(), session_id_ref.clone());
+        let mut wrapped_tools = security::wrap_tools(
+            tool_list,
+            policy.clone(),
+            db.clone(),
+            session_id_ref.clone(),
+        );
 
         // 5. Build budget tracker
         let budget = BudgetTracker::new(
@@ -109,8 +120,10 @@ impl Conductor {
         let provider = resolve_provider(&config.agent.provider);
 
         // 8. Build agent — workers are included in wrapped_tools, no with_sub_agent needed
+        let turns_since_save = Arc::new(AtomicUsize::new(0));
         let budget_check = budget.clone();
         let budget_record = budget.clone();
+        let turns_counter = turns_since_save.clone();
         let mut agent = Agent::new(provider)
             .with_system_prompt(&persona)
             .with_model(&config.agent.model)
@@ -120,7 +133,28 @@ impl Conductor {
             .on_after_turn(move |_messages, usage| {
                 budget_record.record_usage(usage.input, usage.output);
                 budget_record.record_turn();
+                turns_counter.fetch_add(1, Ordering::Relaxed);
             });
+
+        // 8a. Wire up context management from config
+        let ctx = &config.agent.context;
+        if ctx.max_context_tokens.is_some()
+            || ctx.keep_recent.is_some()
+            || ctx.tool_output_max_lines.is_some()
+        {
+            let mut ctx_config = yoagent::context::ContextConfig::default();
+            if let Some(max) = ctx.max_context_tokens {
+                ctx_config.max_context_tokens = max as usize;
+            }
+            if let Some(keep) = ctx.keep_recent {
+                ctx_config.keep_recent = keep;
+            }
+            if let Some(max_lines) = ctx.tool_output_max_lines {
+                ctx_config.tool_output_max_lines = max_lines;
+            }
+            agent = agent.with_context_config(ctx_config);
+            tracing::info!("Context management enabled");
+        }
 
         if let Some(max_tokens) = config.agent.max_tokens {
             agent = agent.with_max_tokens(max_tokens);
@@ -145,6 +179,7 @@ impl Conductor {
             budget,
             loaded_skills,
             worker_infos,
+            turns_since_save,
         })
     }
 
@@ -177,9 +212,10 @@ impl Conductor {
 
         // Persist conversation state
         let messages = self.agent.messages();
-        self.db
-            .tape_save_messages(session_id, messages)
-            .await?;
+        self.db.tape_save_messages(session_id, messages).await?;
+
+        // Reset periodic save counter (we just saved)
+        self.turns_since_save.store(0, Ordering::Relaxed);
 
         Ok(response)
     }
@@ -208,7 +244,11 @@ impl Conductor {
         *self.session_id_ref.write().unwrap() = new_session.to_string();
         self.budget.reset_turns();
 
-        tracing::info!("Switched to session: {} ({} messages)", new_session, messages.len());
+        tracing::info!(
+            "Switched to session: {} ({} messages)",
+            new_session,
+            messages.len()
+        );
         Ok(())
     }
 
@@ -216,38 +256,63 @@ impl Conductor {
     pub fn session_id(&self) -> &str {
         &self.current_session
     }
+
+    /// Delegate a message directly to a named worker, bypassing the main conductor agent.
+    /// Used for channel routing (e.g., Discord channel → specific worker).
+    pub async fn delegate_to_worker(
+        &mut self,
+        session_id: &str,
+        worker_name: &str,
+        text: &str,
+    ) -> Result<String, anyhow::Error> {
+        // Find the worker info by name
+        let _worker = self
+            .worker_infos
+            .iter()
+            .find(|w| w.name == worker_name)
+            .ok_or_else(|| anyhow::anyhow!("Worker '{}' not found", worker_name))?;
+
+        tracing::info!(
+            "Routing to worker '{}' for session {}",
+            worker_name,
+            session_id
+        );
+
+        // Use the conductor's process_message with the worker's system prompt prepended.
+        // The worker hint is informational — the actual routing happens here by
+        // prefixing the message with worker context.
+        let prefixed = format!("[Routed to worker: {}]\n\n{}", worker_name, text);
+        self.process_message(session_id, &prefixed).await
+    }
 }
 
 /// Drain an AgentEvent receiver and return the final response text.
 async fn drain_response(mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> String {
     let mut response = String::new();
     while let Some(event) = rx.recv().await {
-        match event {
-            AgentEvent::AgentEnd { ref messages } => {
-                // Extract text from the last assistant message
-                for msg in messages.iter().rev() {
-                    if let AgentMessage::Llm(Message::Assistant { ref content, .. }) = msg {
-                        for c in content {
-                            if let Content::Text { ref text } = c {
-                                if response.is_empty() {
-                                    response = text.clone();
-                                }
+        if let AgentEvent::AgentEnd { ref messages } = event {
+            // Extract text from the last assistant message
+            for msg in messages.iter().rev() {
+                if let AgentMessage::Llm(Message::Assistant { ref content, .. }) = msg {
+                    for c in content {
+                        if let Content::Text { ref text } = c {
+                            if response.is_empty() {
+                                response = text.clone();
                             }
                         }
-                        if !response.is_empty() {
-                            break;
-                        }
+                    }
+                    if !response.is_empty() {
+                        break;
                     }
                 }
             }
-            _ => {}
         }
     }
     response
 }
 
 /// Resolve a provider name to a StreamProvider implementation.
-fn resolve_provider(name: &str) -> impl yoagent::provider::StreamProvider + 'static {
+pub fn resolve_provider(name: &str) -> impl yoagent::provider::StreamProvider + 'static {
     // For now, always return AnthropicProvider.
     // TODO: support openai, google, etc. via ProviderRegistry
     match name {
@@ -299,6 +364,7 @@ api_key = "test-key"
             budget,
             loaded_skills: Vec::new(),
             worker_infos: Vec::new(),
+            turns_since_save: Arc::new(AtomicUsize::new(0)),
         };
 
         (conductor, db)
@@ -335,13 +401,11 @@ api_key = "test-key"
             budget,
             loaded_skills: Vec::new(),
             worker_infos: Vec::new(),
+            turns_since_save: Arc::new(AtomicUsize::new(0)),
         };
 
         // Send a message
-        conductor
-            .process_message("s1", "Hello")
-            .await
-            .unwrap();
+        conductor.process_message("s1", "Hello").await.unwrap();
 
         // Verify it was saved to tape
         let messages = db.tape_load_messages("s1").await.unwrap();

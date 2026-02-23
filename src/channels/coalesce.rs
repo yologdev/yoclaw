@@ -4,23 +4,39 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
 /// Batches rapid-fire messages from the same session into a single message.
+/// Supports per-channel debounce overrides.
 pub struct MessageCoalescer {
-    debounce: Duration,
+    default_debounce: Duration,
+    channel_debounce: HashMap<String, Duration>,
     input_rx: mpsc::UnboundedReceiver<IncomingMessage>,
     output_tx: mpsc::UnboundedSender<IncomingMessage>,
 }
 
 impl MessageCoalescer {
     pub fn new(
-        debounce: Duration,
+        default_debounce: Duration,
         input_rx: mpsc::UnboundedReceiver<IncomingMessage>,
         output_tx: mpsc::UnboundedSender<IncomingMessage>,
     ) -> Self {
         Self {
-            debounce,
+            default_debounce,
+            channel_debounce: HashMap::new(),
             input_rx,
             output_tx,
         }
+    }
+
+    /// Set per-channel debounce overrides.
+    pub fn with_channel_debounce(mut self, overrides: HashMap<String, Duration>) -> Self {
+        self.channel_debounce = overrides;
+        self
+    }
+
+    fn debounce_for(&self, channel: &str) -> Duration {
+        self.channel_debounce
+            .get(channel)
+            .copied()
+            .unwrap_or(self.default_debounce)
     }
 
     /// Run the coalescer loop. Blocks until the input channel is closed.
@@ -48,8 +64,9 @@ impl MessageCoalescer {
                     match msg {
                         Some(msg) => {
                             let session = msg.session_id.clone();
+                            let debounce = self.debounce_for(&msg.channel);
                             pending.entry(session.clone()).or_default().push(msg);
-                            deadlines.insert(session, Instant::now() + self.debounce);
+                            deadlines.insert(session, Instant::now() + debounce);
                         }
                         None => {
                             // Channel closed — flush remaining
@@ -103,6 +120,7 @@ fn coalesce_messages(mut messages: Vec<IncomingMessage>) -> IncomingMessage {
         content: combined,
         reply_to: first.reply_to.clone(),
         timestamp: first.timestamp,
+        worker_hint: first.worker_hint.clone(),
     }
 }
 
@@ -112,14 +130,19 @@ mod tests {
     use crate::db::now_ms;
 
     fn test_msg(session: &str, content: &str) -> IncomingMessage {
+        test_msg_channel("test", session, content)
+    }
+
+    fn test_msg_channel(channel: &str, session: &str, content: &str) -> IncomingMessage {
         IncomingMessage {
-            channel: "test".into(),
+            channel: channel.into(),
             sender_id: "user1".into(),
             sender_name: Some("User".into()),
             session_id: session.into(),
             content: content.into(),
             reply_to: None,
             timestamp: now_ms(),
+            worker_hint: None,
         }
     }
 
@@ -188,5 +211,46 @@ mod tests {
         let sessions: Vec<String> = vec![msg1.session_id, msg2.session_id];
         assert!(sessions.contains(&"s1".to_string()));
         assert!(sessions.contains(&"s2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_per_channel_debounce() {
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+
+        let mut overrides = HashMap::new();
+        // Channel A: very short debounce (fires fast)
+        overrides.insert("chan_a".to_string(), Duration::from_millis(50));
+        // Channel B: longer debounce
+        overrides.insert("chan_b".to_string(), Duration::from_millis(300));
+
+        let coalescer = MessageCoalescer::new(Duration::from_millis(100), input_rx, output_tx)
+            .with_channel_debounce(overrides);
+
+        tokio::spawn(coalescer.run());
+
+        // Send messages on both channels simultaneously
+        input_tx
+            .send(test_msg_channel("chan_a", "sa", "msg_a"))
+            .unwrap();
+        input_tx
+            .send(test_msg_channel("chan_b", "sb", "msg_b"))
+            .unwrap();
+
+        // Channel A (50ms debounce) should fire first
+        let first = tokio::time::timeout(Duration::from_millis(150), output_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.channel, "chan_a");
+        assert_eq!(first.content, "msg_a");
+
+        // Channel B (300ms debounce) should fire later
+        let second = tokio::time::timeout(Duration::from_millis(500), output_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.channel, "chan_b");
+        assert_eq!(second.content, "msg_b");
     }
 }

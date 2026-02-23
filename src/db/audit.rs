@@ -107,9 +107,7 @@ impl Db {
 fn today_start_ms() -> u64 {
     let now = chrono::Utc::now();
     let today = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-    today
-        .and_utc()
-        .timestamp_millis() as u64
+    today.and_utc().timestamp_millis() as u64
 }
 
 #[cfg(test)]

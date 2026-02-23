@@ -1,4 +1,6 @@
 pub mod coalesce;
+pub mod discord;
+pub mod slack;
 pub mod telegram;
 
 use async_trait::async_trait;
@@ -14,6 +16,8 @@ pub struct IncomingMessage {
     pub content: String,
     pub reply_to: Option<String>,
     pub timestamp: u64,
+    /// If set, route this message directly to a named worker instead of the main conductor.
+    pub worker_hint: Option<String>,
 }
 
 /// An outgoing message to send back through a channel.
@@ -37,4 +41,59 @@ pub trait ChannelAdapter: Send + Sync {
 
     /// Channel name (e.g. "telegram", "discord").
     fn name(&self) -> &str;
+}
+
+/// Split a message into chunks at newline boundaries, respecting max length.
+pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
+    if text.len() <= max_len {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let end = (start + max_len).min(text.len());
+        let split_at = if end < text.len() {
+            // Try to split at a newline
+            text[start..end]
+                .rfind('\n')
+                .map(|p| start + p + 1)
+                .unwrap_or(end)
+        } else {
+            end
+        };
+        chunks.push(text[start..split_at].to_string());
+        start = split_at;
+    }
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_short_message() {
+        let chunks = split_message("hello", 4096);
+        assert_eq!(chunks, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_split_long_message() {
+        let text = "line1\nline2\nline3\nline4";
+        let chunks = split_message(text, 12);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], "line1\nline2\n");
+        assert_eq!(chunks[1], "line3\nline4");
+    }
+
+    #[test]
+    fn test_split_no_newlines() {
+        let text = "a".repeat(100);
+        let chunks = split_message(&text, 40);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 40);
+        assert_eq!(chunks[1].len(), 40);
+        assert_eq!(chunks[2].len(), 20);
+    }
 }

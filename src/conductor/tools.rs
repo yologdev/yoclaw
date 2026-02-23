@@ -1,7 +1,7 @@
 use crate::db::Db;
 use yoagent::types::*;
 
-/// Tool for searching the agent's long-term memory via FTS5.
+/// Tool for searching the agent's long-term memory via FTS5 (with temporal decay).
 pub struct MemorySearchTool {
     db: Db,
 }
@@ -23,7 +23,8 @@ impl AgentTool for MemorySearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the agent's long-term memory using full-text search. Use this to recall previous conversations, user preferences, stored facts, or any context saved earlier."
+        "Search the agent's long-term memory. Results are ranked by relevance with temporal decay \
+         (task memories fade faster than preferences/decisions). Returns category and importance metadata."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -74,7 +75,15 @@ impl AgentTool for MemorySearchTool {
                         .as_ref()
                         .map(|k| format!(" (key: {})", k))
                         .unwrap_or_default();
-                    format!("{}. [{}]{} {}", i + 1, tags, key, m.content)
+                    format!(
+                        "{}. [{}|{}|imp:{}]{} {}",
+                        i + 1,
+                        m.category,
+                        tags,
+                        m.importance,
+                        key,
+                        m.content
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -109,7 +118,9 @@ impl AgentTool for MemoryStoreTool {
     }
 
     fn description(&self) -> &str {
-        "Save information to long-term memory for later recall. Use this to remember user preferences, important facts, decisions, or context that should persist across conversations."
+        "Save information to long-term memory with optional category and importance. Categories: \
+         fact, preference, decision, event, task, reflection. Importance: 1-10 (higher = more important, \
+         less likely to be pruned). Decisions never decay; tasks decay in ~7 days; preferences persist ~90 days."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -127,6 +138,15 @@ impl AgentTool for MemoryStoreTool {
                 "tags": {
                     "type": "string",
                     "description": "Optional comma-separated tags for categorization (e.g. 'preference,user')"
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Memory category: fact, preference, decision, event, task, reflection (default: fact)",
+                    "enum": ["fact", "preference", "decision", "event", "task", "reflection"]
+                },
+                "importance": {
+                    "type": "integer",
+                    "description": "Importance score 1-10 (default: 5). Higher = more important, less likely to be pruned."
                 }
             },
             "required": ["content"]
@@ -145,15 +165,20 @@ impl AgentTool for MemoryStoreTool {
             .ok_or_else(|| ToolError::InvalidArgs("Missing 'content' parameter".into()))?;
         let key = params["key"].as_str();
         let tags = params["tags"].as_str();
+        let category = params["category"].as_str().unwrap_or("fact");
+        let importance = params["importance"].as_i64().unwrap_or(5) as i32;
 
         self.db
-            .memory_store(key, content, tags, Some("agent"))
+            .memory_store_with_meta(key, content, tags, Some("agent"), category, importance)
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
 
         let msg = match key {
-            Some(k) => format!("Stored memory with key '{}'.", k),
-            None => "Stored memory.".to_string(),
+            Some(k) => format!(
+                "Stored {} memory (importance: {}) with key '{}'.",
+                category, importance, k
+            ),
+            None => format!("Stored {} memory (importance: {}).", category, importance),
         };
 
         Ok(ToolResult {
@@ -189,15 +214,33 @@ mod tests {
 
         // Search
         let result = search
+            .execute("2", serde_json::json!({"query": "dark mode"}), cancel, None)
+            .await
+            .unwrap();
+        assert!(content_text(&result.content[0]).contains("dark mode"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_store_with_category() {
+        let db = Db::open_memory().unwrap();
+        let store = MemoryStoreTool::new(db.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let result = store
             .execute(
-                "2",
-                serde_json::json!({"query": "dark mode"}),
+                "1",
+                serde_json::json!({
+                    "content": "Always use bun instead of npm",
+                    "category": "decision",
+                    "importance": 9
+                }),
                 cancel,
                 None,
             )
             .await
             .unwrap();
-        assert!(content_text(&result.content[0]).contains("dark mode"));
+        assert!(content_text(&result.content[0]).contains("decision"));
+        assert!(content_text(&result.content[0]).contains("9"));
     }
 }
 

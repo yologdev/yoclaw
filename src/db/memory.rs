@@ -8,12 +8,40 @@ pub struct MemoryEntry {
     pub content: String,
     pub tags: Option<String>,
     pub source: Option<String>,
+    pub category: String,
+    pub importance: i32,
+    pub last_accessed: Option<u64>,
+    pub access_count: i32,
     pub created_at: u64,
     pub updated_at: u64,
 }
 
+/// Memory categories and their temporal decay half-lives in days.
+/// Returns None for categories that never decay (e.g., decisions).
+pub fn decay_half_life(category: &str) -> Option<f64> {
+    match category {
+        "task" => Some(7.0),
+        "event" => Some(14.0),
+        "fact" => Some(30.0),
+        "reflection" => Some(60.0),
+        "preference" => Some(90.0),
+        "decision" => None, // never decays
+        _ => Some(30.0),    // unknown categories decay like facts
+    }
+}
+
+/// Apply temporal decay multiplier to a score.
+/// Formula: score * 0.5^(age_days / half_life)
+pub fn apply_decay(score: f64, age_days: f64, category: &str) -> f64 {
+    match decay_half_life(category) {
+        Some(half_life) => score * (-0.693 * age_days / half_life).exp(),
+        None => score, // no decay
+    }
+}
+
 impl Db {
-    /// Store a memory entry. If a key is provided and exists, update it.
+    /// Store a memory entry with optional category and importance.
+    /// If a key is provided and exists, update it.
     pub async fn memory_store(
         &self,
         key: Option<&str>,
@@ -21,19 +49,47 @@ impl Db {
         tags: Option<&str>,
         source: Option<&str>,
     ) -> Result<i64, DbError> {
+        self.memory_store_with_meta(key, content, tags, source, "fact", 5)
+            .await
+    }
+
+    /// Store a memory entry with full metadata.
+    pub async fn memory_store_with_meta(
+        &self,
+        key: Option<&str>,
+        content: &str,
+        tags: Option<&str>,
+        source: Option<&str>,
+        category: &str,
+        importance: i32,
+    ) -> Result<i64, DbError> {
         let key = key.map(|s| s.to_string());
         let content = content.to_string();
         let tags = tags.map(|s| s.to_string());
         let source = source.map(|s| s.to_string());
+        let category = category.to_string();
         let ts = now_ms();
         self.exec(move |conn| {
-            memory_store_sync(conn, key.as_deref(), &content, tags.as_deref(), source.as_deref(), ts)
+            memory_store_sync(
+                conn,
+                key.as_deref(),
+                &content,
+                tags.as_deref(),
+                source.as_deref(),
+                &category,
+                importance,
+                ts,
+            )
         })
         .await
     }
 
-    /// Full-text search over memory.
-    pub async fn memory_search(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>, DbError> {
+    /// Full-text search over memory with temporal decay applied.
+    pub async fn memory_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>, DbError> {
         let query = query.to_string();
         self.exec(move |conn| memory_search_sync(conn, &query, limit))
             .await
@@ -53,14 +109,32 @@ impl Db {
         })
         .await
     }
+
+    /// Update access tracking for a set of memory IDs (called after search results are returned).
+    pub async fn memory_touch(&self, ids: Vec<i64>) -> Result<(), DbError> {
+        let ts = now_ms();
+        self.exec(move |conn| {
+            let mut stmt = conn.prepare(
+                "UPDATE memory SET last_accessed = ?1, access_count = access_count + 1 WHERE id = ?2",
+            )?;
+            for id in ids {
+                stmt.execute(rusqlite::params![ts as i64, id])?;
+            }
+            Ok(())
+        })
+        .await
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn memory_store_sync(
     conn: &Connection,
     key: Option<&str>,
     content: &str,
     tags: Option<&str>,
     source: Option<&str>,
+    category: &str,
+    importance: i32,
     ts: u64,
 ) -> Result<i64, DbError> {
     // If key exists, update
@@ -74,17 +148,17 @@ fn memory_store_sync(
             .ok();
         if let Some(id) = existing {
             conn.execute(
-                "UPDATE memory SET content = ?1, tags = ?2, source = ?3, updated_at = ?4 WHERE id = ?5",
-                rusqlite::params![content, tags, source, ts as i64, id],
+                "UPDATE memory SET content = ?1, tags = ?2, source = ?3, category = ?4, importance = ?5, updated_at = ?6 WHERE id = ?7",
+                rusqlite::params![content, tags, source, category, importance, ts as i64, id],
             )?;
             return Ok(id);
         }
     }
     // Insert new
     conn.execute(
-        "INSERT INTO memory (key, content, tags, source, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-        rusqlite::params![key, content, tags, source, ts as i64],
+        "INSERT INTO memory (key, content, tags, source, category, importance, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        rusqlite::params![key, content, tags, source, category, importance, ts as i64],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -96,32 +170,74 @@ fn memory_search_sync(
 ) -> Result<Vec<MemoryEntry>, DbError> {
     // Wrap in double quotes for safe literal matching
     let safe_query = format!("\"{}\"", query.replace('"', "\"\""));
-    let result = memory_search_fts(conn, &safe_query, limit);
-    match result {
-        Ok(entries) => Ok(entries),
+    let result = memory_search_fts(conn, &safe_query, limit * 3); // over-fetch for decay re-ranking
+    let mut entries = match result {
+        Ok(entries) => entries,
         Err(_) => {
             // FTS5 query failed — fall back to LIKE search
-            let pattern = format!("%{}%", query);
-            let mut stmt = conn.prepare(
-                "SELECT id, key, content, tags, source, created_at, updated_at
-                 FROM memory WHERE content LIKE ?1 ORDER BY updated_at DESC LIMIT ?2",
-            )?;
-            let rows = stmt
-                .query_map(rusqlite::params![pattern, limit as i64], |row| {
-                    Ok(MemoryEntry {
-                        id: Some(row.get(0)?),
-                        key: row.get(1)?,
-                        content: row.get(2)?,
-                        tags: row.get(3)?,
-                        source: row.get(4)?,
-                        created_at: row.get::<_, i64>(5)? as u64,
-                        updated_at: row.get::<_, i64>(6)? as u64,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
+            memory_search_like(conn, query, limit * 3)?
+        }
+    };
+
+    // Apply temporal decay and re-rank
+    let now = now_ms();
+    entries.sort_by(|a, b| {
+        let age_a = (now.saturating_sub(a.updated_at)) as f64 / (1000.0 * 60.0 * 60.0 * 24.0);
+        let age_b = (now.saturating_sub(b.updated_at)) as f64 / (1000.0 * 60.0 * 60.0 * 24.0);
+        let score_a = apply_decay(1.0, age_a, &a.category);
+        let score_b = apply_decay(1.0, age_b, &b.category);
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    entries.truncate(limit);
+
+    // Update access tracking for returned results
+    let ids: Vec<i64> = entries.iter().filter_map(|e| e.id).collect();
+    if !ids.is_empty() {
+        let ts = now as i64;
+        let mut stmt = conn.prepare(
+            "UPDATE memory SET last_accessed = ?1, access_count = access_count + 1 WHERE id = ?2",
+        )?;
+        for id in &ids {
+            stmt.execute(rusqlite::params![ts, id])?;
         }
     }
+
+    Ok(entries)
+}
+
+fn memory_search_like(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<MemoryEntry>, DbError> {
+    let pattern = format!("%{}%", query);
+    let mut stmt = conn.prepare(
+        "SELECT id, key, content, tags, source, category, importance, last_accessed, access_count, created_at, updated_at
+         FROM memory WHERE content LIKE ?1 ORDER BY updated_at DESC LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![pattern, limit as i64], |row| {
+            Ok(MemoryEntry {
+                id: Some(row.get(0)?),
+                key: row.get(1)?,
+                content: row.get(2)?,
+                tags: row.get(3)?,
+                source: row.get(4)?,
+                category: row
+                    .get::<_, Option<String>>(5)?
+                    .unwrap_or_else(|| "fact".to_string()),
+                importance: row.get::<_, Option<i32>>(6)?.unwrap_or(5),
+                last_accessed: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                access_count: row.get::<_, Option<i32>>(8)?.unwrap_or(0),
+                created_at: row.get::<_, i64>(9)? as u64,
+                updated_at: row.get::<_, i64>(10)? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 fn memory_search_fts(
@@ -130,7 +246,7 @@ fn memory_search_fts(
     limit: usize,
 ) -> Result<Vec<MemoryEntry>, DbError> {
     let mut stmt = conn.prepare(
-        "SELECT m.id, m.key, m.content, m.tags, m.source, m.created_at, m.updated_at
+        "SELECT m.id, m.key, m.content, m.tags, m.source, m.category, m.importance, m.last_accessed, m.access_count, m.created_at, m.updated_at
          FROM memory m
          JOIN memory_fts f ON m.id = f.rowid
          WHERE memory_fts MATCH ?1
@@ -145,8 +261,14 @@ fn memory_search_fts(
                 content: row.get(2)?,
                 tags: row.get(3)?,
                 source: row.get(4)?,
-                created_at: row.get::<_, i64>(5)? as u64,
-                updated_at: row.get::<_, i64>(6)? as u64,
+                category: row
+                    .get::<_, Option<String>>(5)?
+                    .unwrap_or_else(|| "fact".to_string()),
+                importance: row.get::<_, Option<i32>>(6)?.unwrap_or(5),
+                last_accessed: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                access_count: row.get::<_, Option<i32>>(8)?.unwrap_or(0),
+                created_at: row.get::<_, i64>(9)? as u64,
+                updated_at: row.get::<_, i64>(10)? as u64,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -155,7 +277,7 @@ fn memory_search_fts(
 
 fn memory_get_sync(conn: &Connection, key: &str) -> Result<Option<MemoryEntry>, DbError> {
     let result = conn.query_row(
-        "SELECT id, key, content, tags, source, created_at, updated_at
+        "SELECT id, key, content, tags, source, category, importance, last_accessed, access_count, created_at, updated_at
          FROM memory WHERE key = ?1",
         rusqlite::params![key],
         |row| {
@@ -165,8 +287,12 @@ fn memory_get_sync(conn: &Connection, key: &str) -> Result<Option<MemoryEntry>, 
                 content: row.get(2)?,
                 tags: row.get(3)?,
                 source: row.get(4)?,
-                created_at: row.get::<_, i64>(5)? as u64,
-                updated_at: row.get::<_, i64>(6)? as u64,
+                category: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "fact".to_string()),
+                importance: row.get::<_, Option<i32>>(6)?.unwrap_or(5),
+                last_accessed: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                access_count: row.get::<_, Option<i32>>(8)?.unwrap_or(0),
+                created_at: row.get::<_, i64>(9)? as u64,
+                updated_at: row.get::<_, i64>(10)? as u64,
             })
         },
     );
@@ -191,6 +317,28 @@ mod tests {
         let entry = db.memory_get("user_name").await.unwrap().unwrap();
         assert_eq!(entry.content, "Alice");
         assert_eq!(entry.tags.as_deref(), Some("preference"));
+        assert_eq!(entry.category, "fact"); // default
+        assert_eq!(entry.importance, 5); // default
+    }
+
+    #[tokio::test]
+    async fn test_store_with_category() {
+        let db = Db::open_memory().unwrap();
+        db.memory_store_with_meta(
+            Some("deploy_date"),
+            "Deploy by Friday",
+            Some("work"),
+            Some("agent"),
+            "task",
+            8,
+        )
+        .await
+        .unwrap();
+
+        let entry = db.memory_get("deploy_date").await.unwrap().unwrap();
+        assert_eq!(entry.content, "Deploy by Friday");
+        assert_eq!(entry.category, "task");
+        assert_eq!(entry.importance, 8);
     }
 
     #[tokio::test]
@@ -221,14 +369,55 @@ mod tests {
         assert!(results[0].content.contains("fox"));
 
         let results = db.memory_search("animals", 10).await.unwrap();
-        // FTS5 searches content and tags
         assert!(results.len() >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_search_updates_access_tracking() {
+        let db = Db::open_memory().unwrap();
+        let id = db
+            .memory_store(None, "The quick brown fox", None, None)
+            .await
+            .unwrap();
+
+        // Before search, access_count should be 0
+        let count_before = db
+            .exec(move |conn| {
+                let count: i32 = conn.query_row(
+                    "SELECT access_count FROM memory WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )?;
+                Ok(count)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count_before, 0);
+
+        // Search triggers access tracking update
+        let results = db.memory_search("fox", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Verify access_count was incremented in the database
+        let count_after = db
+            .exec(move |conn| {
+                let count: i32 = conn.query_row(
+                    "SELECT access_count FROM memory WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )?;
+                Ok(count)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count_after, 1);
     }
 
     #[tokio::test]
     async fn test_delete() {
         let db = Db::open_memory().unwrap();
-        let id = db.memory_store(Some("temp"), "temporary", None, None)
+        let id = db
+            .memory_store(Some("temp"), "temporary", None, None)
             .await
             .unwrap();
         db.memory_delete(id).await.unwrap();
@@ -241,5 +430,27 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let results = db.memory_search("nonexistent", 10).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_decay_half_lives() {
+        assert_eq!(decay_half_life("task"), Some(7.0));
+        assert_eq!(decay_half_life("preference"), Some(90.0));
+        assert_eq!(decay_half_life("decision"), None);
+    }
+
+    #[test]
+    fn test_apply_decay() {
+        // A task 7 days old should decay to ~50%
+        let score = apply_decay(1.0, 7.0, "task");
+        assert!((score - 0.5).abs() < 0.01);
+
+        // A decision never decays
+        let score = apply_decay(1.0, 365.0, "decision");
+        assert_eq!(score, 1.0);
+
+        // A preference 90 days old should decay to ~50%
+        let score = apply_decay(1.0, 90.0, "preference");
+        assert!((score - 0.5).abs() < 0.01);
     }
 }

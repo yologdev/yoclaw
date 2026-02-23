@@ -2,5 +2,8 @@ pub mod channels;
 pub mod conductor;
 pub mod config;
 pub mod db;
+pub mod migrate;
+pub mod scheduler;
 pub mod security;
 pub mod skills;
+pub mod web;

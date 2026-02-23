@@ -2,6 +2,8 @@ pub mod audit;
 pub mod memory;
 pub mod queue;
 pub mod tape;
+#[cfg(feature = "semantic")]
+pub mod vector;
 
 use rusqlite::Connection;
 use std::path::Path;
@@ -81,7 +83,20 @@ impl Db {
 
     // -- Migrations --
 
-    const MIGRATIONS: &[(&str, &str)] = &[("001_initial", include_str!("../../migrations/001_initial.sql"))];
+    const MIGRATIONS: &[(&str, &str)] = &[
+        (
+            "001_initial",
+            include_str!("../../migrations/001_initial.sql"),
+        ),
+        (
+            "002_vector_memory",
+            include_str!("../../migrations/002_vector_memory.sql"),
+        ),
+        (
+            "003_scheduler",
+            include_str!("../../migrations/003_scheduler.sql"),
+        ),
+    ];
 
     fn run_migrations(&self) -> Result<(), DbError> {
         let conn = self.conn.lock().map_err(|_| DbError::LockPoisoned)?;
@@ -92,10 +107,11 @@ impl Db {
                 applied_at INTEGER NOT NULL
             );",
         )?;
-        let current: i64 =
-            conn.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| {
-                r.get(0)
-            })?;
+        let current: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |r| r.get(0),
+        )?;
         for (i, (name, sql)) in Self::MIGRATIONS.iter().enumerate() {
             let version = (i + 1) as i64;
             if version > current {
@@ -151,7 +167,7 @@ mod tests {
         db.exec_sync(|conn| {
             let count: i64 =
                 conn.query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))?;
-            assert_eq!(count, 1);
+            assert_eq!(count, 3); // 001_initial + 002_vector_memory + 003_scheduler
             Ok(())
         })
         .unwrap();
