@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="yoclaw banner" width="100%">
+</p>
+
 # yoclaw: Single-Binary AI Agent
 
 **yoclaw** is a minimal, secure alternative to [OpenClaw](https://github.com/anthropics/openclaw) — a single Rust binary that turns any LLM into a persistent, tool-using agent on messaging platforms. Built on [yoagent](https://github.com/yologdev/yoagent).
