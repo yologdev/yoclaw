@@ -104,19 +104,14 @@ impl Conductor {
             tracing::info!("Configured {} worker(s)", worker_infos.len());
         }
 
-        // Build a second set of workers for direct delegation (bypassing main agent)
+        // Build a second set of workers for direct delegation (bypassing main agent).
+        // No outer SecureToolWrapper here — the SubAgentTool's inner tools are already
+        // security-wrapped via worker_tools, and wrapping the SubAgentTool itself would
+        // produce misleading audit entries under the worker name (e.g., "coding").
         let direct_workers_raw = delegate::build_workers(config, &worker_tools);
         let mut direct_workers: HashMap<String, Box<dyn AgentTool>> = HashMap::new();
         for (sub_agent, info) in direct_workers_raw {
-            direct_workers.insert(
-                info.name.clone(),
-                Box::new(security::SecureToolWrapper {
-                    inner: Box::new(sub_agent),
-                    policy: policy.clone(),
-                    db: db.clone(),
-                    session_id: session_id_ref.clone(),
-                }),
-            );
+            direct_workers.insert(info.name.clone(), Box::new(sub_agent));
         }
 
         // Wrap each SubAgentTool with SecureToolWrapper so worker delegations
