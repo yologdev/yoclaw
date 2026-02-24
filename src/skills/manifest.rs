@@ -1,7 +1,7 @@
-/// Parse extended YAML frontmatter from SKILL.md files.
-///
-/// yoagent's built-in parser only extracts `name` and `description`.
-/// We additionally parse the `tools` field for capability-based filtering.
+//! Parse extended YAML frontmatter from SKILL.md files.
+//!
+//! yoagent's built-in parser only extracts `name` and `description`.
+//! We additionally parse the `tools` field for capability-based filtering.
 
 /// Parsed skill manifest from SKILL.md frontmatter.
 #[derive(Debug, Clone)]

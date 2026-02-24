@@ -93,24 +93,26 @@ impl SecurityPolicy {
             }
 
             // Check path allowlists for file tools
-            if matches!(tool_name, "read_file" | "write_file" | "edit_file" | "list_files" | "search") {
-                if !perm.allowed_paths.is_empty() {
-                    let file_path = args
-                        .get("file_path")
-                        .or_else(|| args.get("path"))
-                        .and_then(|v| v.as_str());
-                    if let Some(path) = file_path {
-                        let path_expanded = crate::config::expand_tilde(path);
-                        let allowed = perm.allowed_paths.iter().any(|allowed| {
-                            let allowed_expanded = crate::config::expand_tilde(allowed);
-                            path_expanded.starts_with(&allowed_expanded)
+            if matches!(
+                tool_name,
+                "read_file" | "write_file" | "edit_file" | "list_files" | "search"
+            ) && !perm.allowed_paths.is_empty()
+            {
+                let file_path = args
+                    .get("file_path")
+                    .or_else(|| args.get("path"))
+                    .and_then(|v| v.as_str());
+                if let Some(path) = file_path {
+                    let path_expanded = crate::config::expand_tilde(path);
+                    let allowed = perm.allowed_paths.iter().any(|allowed| {
+                        let allowed_expanded = crate::config::expand_tilde(allowed);
+                        path_expanded.starts_with(&allowed_expanded)
+                    });
+                    if !allowed {
+                        return Err(SecurityDenied::PathNotAllowed {
+                            tool: tool_name.to_string(),
+                            path: path.to_string(),
                         });
-                        if !allowed {
-                            return Err(SecurityDenied::PathNotAllowed {
-                                tool: tool_name.to_string(),
-                                path: path.to_string(),
-                            });
-                        }
                     }
                 }
             }
@@ -201,7 +203,9 @@ impl yoagent::AgentTool for SecureToolWrapper {
             .await;
 
         // Execute the actual tool
-        self.inner.execute(tool_call_id, params, cancel, on_update).await
+        self.inner
+            .execute(tool_call_id, params, cancel, on_update)
+            .await
     }
 }
 

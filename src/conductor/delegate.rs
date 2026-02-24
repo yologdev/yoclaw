@@ -38,15 +38,9 @@ pub fn build_workers(
     let default_max_tokens = workers_config.max_tokens.or(config.agent.max_tokens);
 
     for (name, worker) in &workers_config.named {
-        let provider_name = worker
-            .provider
-            .as_deref()
-            .unwrap_or(default_provider);
+        let provider_name = worker.provider.as_deref().unwrap_or(default_provider);
         let model = worker.model.as_deref().unwrap_or(default_model);
-        let api_key = worker
-            .api_key
-            .as_deref()
-            .unwrap_or(&config.agent.api_key);
+        let api_key = worker.api_key.as_deref().unwrap_or(&config.agent.api_key);
         let max_turns = worker.max_turns.unwrap_or(10);
 
         let provider = resolve_arc_provider(provider_name);

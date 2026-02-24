@@ -7,6 +7,7 @@ use crate::security::budget::BudgetTracker;
 use crate::security::{self, SecurityPolicy};
 use crate::skills::LoadedSkill;
 use delegate::WorkerInfo;
+use std::collections::HashMap;
 use std::sync::Arc;
 use yoagent::provider::AnthropicProvider;
 use yoagent::types::*;
@@ -21,6 +22,8 @@ pub struct Conductor {
     budget: BudgetTracker,
     loaded_skills: Vec<LoadedSkill>,
     worker_infos: Vec<WorkerInfo>,
+    /// Worker sub-agent tools for direct delegation (bypassing main agent).
+    direct_workers: HashMap<String, Box<dyn AgentTool>>,
 }
 
 impl Conductor {
@@ -56,11 +59,18 @@ impl Conductor {
         let mut tool_list: Vec<Box<dyn AgentTool>> = yoagent::tools::default_tools();
         tool_list.push(Box::new(tools::MemorySearchTool::new(db.clone())));
         tool_list.push(Box::new(tools::MemoryStoreTool::new(db.clone())));
+        tool_list.push(Box::new(crate::scheduler::tools::CronScheduleTool::new(
+            db.clone(),
+        )));
 
         // 4. Wrap with security
         let session_id_ref = Arc::new(std::sync::RwLock::new(String::new()));
-        let mut wrapped_tools =
-            security::wrap_tools(tool_list, policy.clone(), db.clone(), session_id_ref.clone());
+        let mut wrapped_tools = security::wrap_tools(
+            tool_list,
+            policy.clone(),
+            db.clone(),
+            session_id_ref.clone(),
+        );
 
         // 5. Build budget tracker
         let budget = BudgetTracker::new(
@@ -94,6 +104,16 @@ impl Conductor {
             tracing::info!("Configured {} worker(s)", worker_infos.len());
         }
 
+        // Build a second set of workers for direct delegation (bypassing main agent).
+        // No outer SecureToolWrapper here — the SubAgentTool's inner tools are already
+        // security-wrapped via worker_tools, and wrapping the SubAgentTool itself would
+        // produce misleading audit entries under the worker name (e.g., "coding").
+        let direct_workers_raw = delegate::build_workers(config, &worker_tools);
+        let mut direct_workers: HashMap<String, Box<dyn AgentTool>> = HashMap::new();
+        for (sub_agent, info) in direct_workers_raw {
+            direct_workers.insert(info.name.clone(), Box::new(sub_agent));
+        }
+
         // Wrap each SubAgentTool with SecureToolWrapper so worker delegations
         // are audit-logged and security-checked (Gap 1 fix)
         for (sub_agent, _info) in workers {
@@ -122,6 +142,26 @@ impl Conductor {
                 budget_record.record_turn();
             });
 
+        // 8a. Wire up context management from config
+        let ctx = &config.agent.context;
+        if ctx.max_context_tokens.is_some()
+            || ctx.keep_recent.is_some()
+            || ctx.tool_output_max_lines.is_some()
+        {
+            let mut ctx_config = yoagent::context::ContextConfig::default();
+            if let Some(max) = ctx.max_context_tokens {
+                ctx_config.max_context_tokens = max as usize;
+            }
+            if let Some(keep) = ctx.keep_recent {
+                ctx_config.keep_recent = keep;
+            }
+            if let Some(max_lines) = ctx.tool_output_max_lines {
+                ctx_config.tool_output_max_lines = max_lines;
+            }
+            agent = agent.with_context_config(ctx_config);
+            tracing::info!("Context management enabled");
+        }
+
         if let Some(max_tokens) = config.agent.max_tokens {
             agent = agent.with_max_tokens(max_tokens);
         }
@@ -145,6 +185,7 @@ impl Conductor {
             budget,
             loaded_skills,
             worker_infos,
+            direct_workers,
         })
     }
 
@@ -177,9 +218,7 @@ impl Conductor {
 
         // Persist conversation state
         let messages = self.agent.messages();
-        self.db
-            .tape_save_messages(session_id, messages)
-            .await?;
+        self.db.tape_save_messages(session_id, messages).await?;
 
         Ok(response)
     }
@@ -208,7 +247,11 @@ impl Conductor {
         *self.session_id_ref.write().unwrap() = new_session.to_string();
         self.budget.reset_turns();
 
-        tracing::info!("Switched to session: {} ({} messages)", new_session, messages.len());
+        tracing::info!(
+            "Switched to session: {} ({} messages)",
+            new_session,
+            messages.len()
+        );
         Ok(())
     }
 
@@ -216,38 +259,103 @@ impl Conductor {
     pub fn session_id(&self) -> &str {
         &self.current_session
     }
+
+    /// Delegate a message directly to a named worker's sub-agent, bypassing the main conductor.
+    /// Used for channel routing (e.g., Discord channel → specific worker).
+    pub async fn delegate_to_worker(
+        &mut self,
+        session_id: &str,
+        worker_name: &str,
+        text: &str,
+    ) -> Result<String, anyhow::Error> {
+        if !self.direct_workers.contains_key(worker_name) {
+            anyhow::bail!("Worker '{}' not found", worker_name);
+        }
+
+        tracing::info!(
+            "Delegating to worker '{}' for session {}",
+            worker_name,
+            session_id
+        );
+
+        // Update session_id reference for audit logging
+        *self.session_id_ref.write().unwrap() = session_id.to_string();
+
+        // Execute the worker's sub-agent directly
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let params = serde_json::json!({"task": text});
+        let worker_tool = self.direct_workers.get(worker_name).unwrap();
+        let result = worker_tool
+            .execute("direct-delegate", params, cancel, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Worker '{}' failed: {:?}", worker_name, e))?;
+
+        let response = result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Save current agent state if we're in this session
+        if self.current_session == session_id {
+            let messages = self.agent.messages();
+            self.db.tape_save_messages(session_id, messages).await?;
+        }
+
+        // Append the worker exchange to the session tape
+        let mut messages = self.db.tape_load_messages(session_id).await?;
+        messages.push(AgentMessage::Llm(Message::user(text)));
+        messages.push(AgentMessage::Llm(Message::Assistant {
+            content: vec![Content::Text {
+                text: response.clone(),
+            }],
+            stop_reason: StopReason::Stop,
+            model: format!("worker:{}", worker_name),
+            provider: "worker".to_string(),
+            usage: Usage::default(),
+            timestamp: crate::db::now_ms(),
+            error_message: None,
+        }));
+        self.db.tape_save_messages(session_id, &messages).await?;
+
+        // Invalidate current session so next process_message reloads from tape
+        self.current_session = String::new();
+
+        Ok(response)
+    }
 }
 
 /// Drain an AgentEvent receiver and return the final response text.
 async fn drain_response(mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> String {
     let mut response = String::new();
     while let Some(event) = rx.recv().await {
-        match event {
-            AgentEvent::AgentEnd { ref messages } => {
-                // Extract text from the last assistant message
-                for msg in messages.iter().rev() {
-                    if let AgentMessage::Llm(Message::Assistant { ref content, .. }) = msg {
-                        for c in content {
-                            if let Content::Text { ref text } = c {
-                                if response.is_empty() {
-                                    response = text.clone();
-                                }
+        if let AgentEvent::AgentEnd { ref messages } = event {
+            // Extract text from the last assistant message
+            for msg in messages.iter().rev() {
+                if let AgentMessage::Llm(Message::Assistant { ref content, .. }) = msg {
+                    for c in content {
+                        if let Content::Text { ref text } = c {
+                            if response.is_empty() {
+                                response = text.clone();
                             }
                         }
-                        if !response.is_empty() {
-                            break;
-                        }
+                    }
+                    if !response.is_empty() {
+                        break;
                     }
                 }
             }
-            _ => {}
         }
     }
     response
 }
 
 /// Resolve a provider name to a StreamProvider implementation.
-fn resolve_provider(name: &str) -> impl yoagent::provider::StreamProvider + 'static {
+pub fn resolve_provider(name: &str) -> impl yoagent::provider::StreamProvider + 'static {
     // For now, always return AnthropicProvider.
     // TODO: support openai, google, etc. via ProviderRegistry
     match name {
@@ -299,6 +407,7 @@ api_key = "test-key"
             budget,
             loaded_skills: Vec::new(),
             worker_infos: Vec::new(),
+            direct_workers: HashMap::new(),
         };
 
         (conductor, db)
@@ -335,13 +444,11 @@ api_key = "test-key"
             budget,
             loaded_skills: Vec::new(),
             worker_infos: Vec::new(),
+            direct_workers: HashMap::new(),
         };
 
         // Send a message
-        conductor
-            .process_message("s1", "Hello")
-            .await
-            .unwrap();
+        conductor.process_message("s1", "Hello").await.unwrap();
 
         // Verify it was saved to tape
         let messages = db.tape_load_messages("s1").await.unwrap();

@@ -21,17 +21,12 @@ impl Db {
         let json = serde_json::to_string(messages)?;
         let count = messages.len();
         let ts = now_ms();
-        self.exec(move |conn| {
-            tape_save_sync(conn, &session_id, &json, count, ts)
-        })
-        .await
+        self.exec(move |conn| tape_save_sync(conn, &session_id, &json, count, ts))
+            .await
     }
 
     /// Load messages for a session. Returns empty vec if session not found.
-    pub async fn tape_load_messages(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<AgentMessage>, DbError> {
+    pub async fn tape_load_messages(&self, session_id: &str) -> Result<Vec<AgentMessage>, DbError> {
         let session_id = session_id.to_string();
         self.exec(move |conn| tape_load_sync(conn, &session_id))
             .await
@@ -39,7 +34,7 @@ impl Db {
 
     /// List all sessions.
     pub async fn tape_list_sessions(&self) -> Result<Vec<SessionInfo>, DbError> {
-        self.exec(|conn| tape_list_sync(conn)).await
+        self.exec(tape_list_sync).await
     }
 }
 
@@ -150,8 +145,12 @@ mod tests {
     #[tokio::test]
     async fn test_list_sessions() {
         let db = Db::open_memory().unwrap();
-        db.tape_save_messages("a", &sample_messages()).await.unwrap();
-        db.tape_save_messages("b", &sample_messages()).await.unwrap();
+        db.tape_save_messages("a", &sample_messages())
+            .await
+            .unwrap();
+        db.tape_save_messages("b", &sample_messages())
+            .await
+            .unwrap();
 
         let sessions = db.tape_list_sessions().await.unwrap();
         assert_eq!(sessions.len(), 2);

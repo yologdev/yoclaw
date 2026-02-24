@@ -13,7 +13,11 @@ pub struct BudgetTracker {
 }
 
 impl BudgetTracker {
-    pub fn new(max_tokens_per_day: Option<u64>, max_turns_per_session: Option<usize>, db: Db) -> Self {
+    pub fn new(
+        max_tokens_per_day: Option<u64>,
+        max_turns_per_session: Option<usize>,
+        db: Db,
+    ) -> Self {
         Self {
             max_tokens_per_day,
             max_turns_per_session,
@@ -37,12 +41,7 @@ impl BudgetTracker {
         let prev = self.tokens_today.fetch_add(total, Ordering::Relaxed);
         if let Some(max) = self.max_tokens_per_day {
             if prev + total > max {
-                tracing::warn!(
-                    "Token budget exceeded: {} + {} > {}",
-                    prev,
-                    total,
-                    max
-                );
+                tracing::warn!("Token budget exceeded: {} + {} > {}", prev, total, max);
                 return false;
             }
         }

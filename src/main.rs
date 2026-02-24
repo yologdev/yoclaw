@@ -1,9 +1,15 @@
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use yoclaw::channels::ChannelAdapter;
 
 #[derive(Parser)]
-#[command(name = "yoclaw", version, about = "Secure, single-binary AI agent orchestrator")]
+#[command(
+    name = "yoclaw",
+    version,
+    about = "Secure, single-binary AI agent orchestrator"
+)]
 struct Cli {
     /// Path to config file (default: ~/.yoclaw/config.toml)
     #[arg(short, long)]
@@ -29,6 +35,11 @@ enum Commands {
     },
     /// Initialize a new yoclaw config directory
     Init,
+    /// Migrate from an OpenClaw installation
+    Migrate {
+        /// Path to the OpenClaw data directory
+        openclaw_dir: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -49,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
             skills,
             workers,
         }) => run_inspect(cli.config.as_deref(), session, skills, workers).await,
+        Some(Commands::Migrate { openclaw_dir }) => yoclaw::migrate::run_migrate(&openclaw_dir),
         None => run_main(cli.config.as_deref()).await,
     }
 }
@@ -118,8 +130,7 @@ async fn run_inspect(
     // Skills info
     if show_skills {
         let skills_dirs = config.skills_dirs();
-        let skills_refs: Vec<&std::path::Path> =
-            skills_dirs.iter().map(|p| p.as_path()).collect();
+        let skills_refs: Vec<&std::path::Path> = skills_dirs.iter().map(|p| p.as_path()).collect();
         let policy = yoclaw::security::SecurityPolicy::from_config(&config.security);
         let (_prompt, loaded) = yoclaw::skills::load_filtered_skills(&skills_refs, &policy);
 
@@ -228,28 +239,101 @@ async fn run_main(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
     let (coalesced_tx, mut coalesced_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let debounce = config
-        .channels
-        .telegram
-        .as_ref()
-        .map(|t| Duration::from_millis(t.debounce_ms))
-        .unwrap_or(Duration::from_secs(2));
+    // Build per-channel debounce map
+    let mut channel_debounce: HashMap<String, Duration> = HashMap::new();
+    if let Some(ref tg) = config.channels.telegram {
+        channel_debounce.insert("telegram".into(), Duration::from_millis(tg.debounce_ms));
+    }
+    if let Some(ref dc) = config.channels.discord {
+        channel_debounce.insert("discord".into(), Duration::from_millis(dc.debounce_ms));
+    }
+    if let Some(ref sl) = config.channels.slack {
+        channel_debounce.insert("slack".into(), Duration::from_millis(sl.debounce_ms));
+    }
 
-    let coalescer =
-        yoclaw::channels::coalesce::MessageCoalescer::new(debounce, raw_rx, coalesced_tx);
+    let coalescer = yoclaw::channels::coalesce::MessageCoalescer::new(
+        Duration::from_secs(2),
+        raw_rx,
+        coalesced_tx,
+    )
+    .with_channel_debounce(channel_debounce);
     tokio::spawn(coalescer.run());
 
-    // Collect adapters for sending responses
-    let mut adapters: Vec<Box<dyn yoclaw::channels::ChannelAdapter>> = Vec::new();
+    // Collect adapters for sending responses (Arc for sharing with scheduler delivery)
+    let mut adapters: Vec<Arc<dyn yoclaw::channels::ChannelAdapter>> = Vec::new();
 
     if let Some(tg_config) = config.channels.telegram.clone() {
         let adapter = yoclaw::channels::telegram::TelegramAdapter::new(tg_config);
         adapter.start(raw_tx.clone()).await?;
-        adapters.push(Box::new(adapter));
+        adapters.push(Arc::new(adapter));
+    }
+
+    if let Some(dc_config) = config.channels.discord.clone() {
+        let adapter = yoclaw::channels::discord::DiscordAdapter::new(dc_config);
+        adapter.start(raw_tx.clone()).await?;
+        adapters.push(Arc::new(adapter));
+    }
+
+    if let Some(sl_config) = config.channels.slack.clone() {
+        let adapter = yoclaw::channels::slack::SlackAdapter::new(sl_config);
+        adapter.start(raw_tx.clone()).await?;
+        adapters.push(Arc::new(adapter));
     }
 
     if adapters.is_empty() {
-        anyhow::bail!("No channels configured. Add [channels.telegram] to config.toml.");
+        anyhow::bail!("No channels configured. Add [channels.telegram], [channels.discord], or [channels.slack] to config.toml.");
+    }
+
+    // Web UI
+    let (sse_tx, _) = tokio::sync::broadcast::channel::<yoclaw::web::SseEvent>(256);
+    let sse_tx_clone = sse_tx.clone();
+
+    if config.web.enabled {
+        let web_db = db.clone();
+        let web_sse_tx = sse_tx.clone();
+        // Scheduler needs &config below, so build Arc separately for the web server
+        let web_config = Arc::new(yoclaw::config::load_config(config_path)?);
+        tokio::spawn(async move {
+            if let Err(e) = yoclaw::web::start_server(web_db, web_config, web_sse_tx).await {
+                tracing::error!("Web server error: {}", e);
+            }
+        });
+    }
+
+    // Scheduler
+    if config.scheduler.enabled {
+        // Create a delivery channel for cron job results
+        let (delivery_tx, mut delivery_rx) =
+            tokio::sync::mpsc::unbounded_channel::<yoclaw::channels::OutgoingMessage>();
+
+        let scheduler = yoclaw::scheduler::Scheduler::new(db.clone(), &config, Some(delivery_tx));
+        tokio::spawn(async move {
+            scheduler.run().await;
+        });
+
+        // Route scheduler deliveries to channel adapters
+        let delivery_adapters = adapters.clone();
+        tokio::spawn(async move {
+            while let Some(outgoing) = delivery_rx.recv().await {
+                tracing::info!(
+                    "Scheduler delivery to {}: {}",
+                    outgoing.channel,
+                    if outgoing.content.len() > 80 {
+                        format!("{}...", &outgoing.content[..80])
+                    } else {
+                        outgoing.content.clone()
+                    }
+                );
+                for adapter in &delivery_adapters {
+                    if adapter.name() == outgoing.channel {
+                        if let Err(e) = adapter.send(outgoing.clone()).await {
+                            tracing::error!("Scheduler delivery error: {}", e);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     // Ctrl+C handler: first signal logs + exits cleanly, second forces exit
@@ -281,10 +365,17 @@ async fn run_main(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
             truncate(&incoming.content, 80)
         );
 
-        match conductor
-            .process_message(&incoming.session_id, &incoming.content)
-            .await
-        {
+        let result = if let Some(ref worker_name) = incoming.worker_hint {
+            conductor
+                .delegate_to_worker(&incoming.session_id, worker_name, &incoming.content)
+                .await
+        } else {
+            conductor
+                .process_message(&incoming.session_id, &incoming.content)
+                .await
+        };
+
+        match result {
             Ok(response) => {
                 tracing::info!("Response: {}", truncate(&response, 80));
 
@@ -305,6 +396,12 @@ async fn run_main(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
                 }
 
                 db.queue_mark_done(queue_id).await?;
+
+                // Emit SSE event for web UI
+                let _ = sse_tx_clone.send(yoclaw::web::SseEvent::MessageProcessed {
+                    session_id: incoming.session_id.clone(),
+                    channel: incoming.channel.clone(),
+                });
             }
             Err(e) => {
                 tracing::error!("Processing error: {}", e);
