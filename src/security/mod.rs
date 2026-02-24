@@ -163,10 +163,8 @@ impl yoagent::AgentTool for SecureToolWrapper {
 
     async fn execute(
         &self,
-        tool_call_id: &str,
         params: serde_json::Value,
-        cancel: tokio_util::sync::CancellationToken,
-        on_update: Option<yoagent::ToolUpdateFn>,
+        ctx: yoagent::types::ToolContext,
     ) -> Result<yoagent::ToolResult, yoagent::ToolError> {
         // Check security policy
         if let Err(denied) = self.policy.check_tool_call(self.inner.name(), &params) {
@@ -203,9 +201,7 @@ impl yoagent::AgentTool for SecureToolWrapper {
             .await;
 
         // Execute the actual tool
-        self.inner
-            .execute(tool_call_id, params, cancel, on_update)
-            .await
+        self.inner.execute(params, ctx).await
     }
 }
 

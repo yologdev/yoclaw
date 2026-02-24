@@ -71,10 +71,8 @@ impl AgentTool for CronScheduleTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
         params: serde_json::Value,
-        _cancel: tokio_util::sync::CancellationToken,
-        _on_update: Option<ToolUpdateFn>,
+        _ctx: ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let action = params["action"]
             .as_str()
@@ -205,16 +203,24 @@ mod tests {
     use super::*;
     use crate::db::Db;
 
+    fn test_ctx() -> ToolContext {
+        ToolContext {
+            tool_call_id: "test".to_string(),
+            tool_name: "cron_schedule".to_string(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            on_update: None,
+            on_progress: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_cron_tool_create_and_list() {
         let db = Db::open_memory().unwrap();
         let tool = CronScheduleTool::new(db);
-        let cancel = tokio_util::sync::CancellationToken::new();
 
         // Create a job
         let result = tool
             .execute(
-                "1",
                 serde_json::json!({
                     "action": "create",
                     "name": "morning-check",
@@ -222,8 +228,7 @@ mod tests {
                     "prompt": "Check my email",
                     "target": "telegram"
                 }),
-                cancel.clone(),
-                None,
+                test_ctx(),
             )
             .await
             .unwrap();
@@ -233,10 +238,8 @@ mod tests {
         // List jobs
         let result = tool
             .execute(
-                "2",
                 serde_json::json!({ "action": "list" }),
-                cancel.clone(),
-                None,
+                test_ctx(),
             )
             .await
             .unwrap();
@@ -249,29 +252,24 @@ mod tests {
     async fn test_cron_tool_delete() {
         let db = Db::open_memory().unwrap();
         let tool = CronScheduleTool::new(db);
-        let cancel = tokio_util::sync::CancellationToken::new();
 
         // Create then delete
         tool.execute(
-            "1",
             serde_json::json!({
                 "action": "create",
                 "name": "to-remove",
                 "schedule": "0 9 * * *",
                 "prompt": "test"
             }),
-            cancel.clone(),
-            None,
+            test_ctx(),
         )
         .await
         .unwrap();
 
         let result = tool
             .execute(
-                "2",
                 serde_json::json!({ "action": "delete", "name": "to-remove" }),
-                cancel.clone(),
-                None,
+                test_ctx(),
             )
             .await
             .unwrap();
@@ -280,10 +278,8 @@ mod tests {
         // Delete nonexistent
         let result = tool
             .execute(
-                "3",
                 serde_json::json!({ "action": "delete", "name": "to-remove" }),
-                cancel,
-                None,
+                test_ctx(),
             )
             .await
             .unwrap();
@@ -294,28 +290,23 @@ mod tests {
     async fn test_cron_tool_toggle() {
         let db = Db::open_memory().unwrap();
         let tool = CronScheduleTool::new(db);
-        let cancel = tokio_util::sync::CancellationToken::new();
 
         tool.execute(
-            "1",
             serde_json::json!({
                 "action": "create",
                 "name": "toggler",
                 "schedule": "0 9 * * *",
                 "prompt": "test"
             }),
-            cancel.clone(),
-            None,
+            test_ctx(),
         )
         .await
         .unwrap();
 
         let result = tool
             .execute(
-                "2",
                 serde_json::json!({ "action": "toggle", "name": "toggler", "enabled": false }),
-                cancel,
-                None,
+                test_ctx(),
             )
             .await
             .unwrap();
