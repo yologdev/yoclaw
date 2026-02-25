@@ -27,6 +27,9 @@ pub struct Conductor {
     direct_workers: HashMap<String, Box<dyn AgentTool>>,
     /// Max messages to restore for group chat catch-up.
     max_group_catchup: usize,
+    /// Messages trimmed from the front during group chat catch-up.
+    /// Prepended back when saving to preserve the full tape.
+    group_catchup_prefix: Vec<AgentMessage>,
 }
 
 impl Conductor {
@@ -206,6 +209,7 @@ impl Conductor {
             worker_infos,
             direct_workers,
             max_group_catchup: config.agent.context.max_group_catchup_messages,
+            group_catchup_prefix: Vec::new(),
         })
     }
 
@@ -292,9 +296,17 @@ impl Conductor {
                 .await;
         }
 
-        // Persist conversation state — always save the FULL tape (slicing is read-only)
-        let messages = self.agent.messages();
-        self.db.tape_save_messages(session_id, messages).await?;
+        // Persist conversation state — reconstruct full tape if group catchup trimmed a prefix
+        let prefix = std::mem::take(&mut self.group_catchup_prefix);
+        if prefix.is_empty() {
+            self.db
+                .tape_save_messages(session_id, self.agent.messages())
+                .await?;
+        } else {
+            let mut full_tape = prefix;
+            full_tape.extend_from_slice(self.agent.messages());
+            self.db.tape_save_messages(session_id, &full_tape).await?;
+        }
 
         Ok(result.response)
     }
@@ -317,13 +329,21 @@ impl Conductor {
         // Load new session
         let mut messages = self.db.tape_load_messages(new_session).await?;
 
-        // Group chat catch-up: only load messages since the last assistant reply
+        // Group chat catch-up: only load messages since the last assistant reply.
+        // Store the trimmed prefix so we can reconstruct the full tape when saving.
+        self.group_catchup_prefix = Vec::new();
         if is_group && !messages.is_empty() {
-            messages = catchup_messages(messages, self.max_group_catchup);
+            let catchup = catchup_messages(messages.clone(), self.max_group_catchup);
+            let prefix_len = messages.len() - catchup.len();
+            if prefix_len > 0 {
+                self.group_catchup_prefix = messages[..prefix_len].to_vec();
+            }
+            messages = catchup;
             tracing::info!(
-                "Group catch-up for {}: loading {} messages",
+                "Group catch-up for {}: loading {} messages ({} preserved in prefix)",
                 new_session,
-                messages.len()
+                messages.len(),
+                prefix_len,
             );
         }
 
@@ -556,6 +576,7 @@ api_key = "test-key"
             worker_infos: Vec::new(),
             direct_workers: HashMap::new(),
             max_group_catchup: 50,
+            group_catchup_prefix: Vec::new(),
         };
 
         (conductor, db)
@@ -599,6 +620,7 @@ api_key = "test-key"
             worker_infos: Vec::new(),
             direct_workers: HashMap::new(),
             max_group_catchup: 50,
+            group_catchup_prefix: Vec::new(),
         };
 
         // Send a message
@@ -725,6 +747,7 @@ api_key = "test-key"
             worker_infos: Vec::new(),
             direct_workers: HashMap::new(),
             max_group_catchup: 50,
+            group_catchup_prefix: Vec::new(),
         };
 
         let response = conductor
@@ -774,5 +797,97 @@ api_key = "test-key"
         assert!(result.input_rejected.is_none());
         let captured = progress_msgs.lock().unwrap();
         assert_eq!(&*captured, &["Step 1 done"]);
+    }
+
+    #[tokio::test]
+    async fn test_group_catchup_preserves_full_tape() {
+        let db = Db::open_memory().unwrap();
+
+        // Pre-populate tape with old conversation (4 messages)
+        let old_messages = vec![
+            AgentMessage::Llm(Message::user("ancient question")),
+            AgentMessage::Llm(Message::Assistant {
+                content: vec![Content::Text {
+                    text: "ancient answer".to_string(),
+                }],
+                stop_reason: StopReason::Stop,
+                model: "mock".to_string(),
+                provider: "mock".to_string(),
+                usage: Usage::default(),
+                timestamp: 0,
+                error_message: None,
+            }),
+            AgentMessage::Llm(Message::user("recent question")),
+            AgentMessage::Llm(Message::Assistant {
+                content: vec![Content::Text {
+                    text: "recent answer".to_string(),
+                }],
+                stop_reason: StopReason::Stop,
+                model: "mock".to_string(),
+                provider: "mock".to_string(),
+                usage: Usage::default(),
+                timestamp: 1,
+                error_message: None,
+            }),
+            AgentMessage::Llm(Message::user("new group msg")),
+        ];
+        db.tape_save_messages("group-full", &old_messages)
+            .await
+            .unwrap();
+
+        let provider = MockProvider::text("Group reply");
+        let budget = BudgetTracker::new(None, None, db.clone());
+        let session_id_ref = Arc::new(std::sync::RwLock::new(String::new()));
+        let policy_ref = Arc::new(std::sync::RwLock::new(SecurityPolicy {
+            shell_deny_patterns: vec![],
+            tool_permissions: HashMap::new(),
+        }));
+
+        let agent = Agent::new(provider)
+            .with_system_prompt("test")
+            .with_model("mock")
+            .with_api_key("test")
+            .without_context_management();
+
+        let mut conductor = Conductor {
+            agent,
+            db: db.clone(),
+            current_session: String::new(),
+            session_id_ref,
+            policy_ref,
+            budget,
+            loaded_skills: Vec::new(),
+            worker_infos: Vec::new(),
+            direct_workers: HashMap::new(),
+            max_group_catchup: 50,
+            group_catchup_prefix: Vec::new(),
+        };
+
+        // Process a group message — should use catchup slicing
+        conductor
+            .process_group_message("group-full", "another msg", None)
+            .await
+            .unwrap();
+
+        // Verify the full tape is preserved (not just the catchup slice)
+        let saved = db.tape_load_messages("group-full").await.unwrap();
+        // Should contain: ancient question, ancient answer, recent question, recent answer,
+        // new group msg (from pre-populated), another msg (new user input), Group reply (new response)
+        assert!(
+            saved.len() >= old_messages.len(),
+            "Full tape was truncated! Expected >= {} messages, got {}",
+            old_messages.len(),
+            saved.len()
+        );
+        // The first message should still be the ancient question
+        if let AgentMessage::Llm(Message::User { ref content, .. }) = saved[0] {
+            if let Some(Content::Text { ref text }) = content.first() {
+                assert_eq!(text, "ancient question");
+            } else {
+                panic!("Expected text content in first message");
+            }
+        } else {
+            panic!("Expected user message as first message");
+        }
     }
 }

@@ -120,6 +120,10 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
     {
         restart_required.push("channels.discord.bot_token");
     }
+    // Injection detector is baked into Agent at startup — cannot hot-reload
+    if old.security.injection != new.security.injection {
+        restart_required.push("security.injection");
+    }
 
     ConfigDiff {
         budget_changed: old.agent.budget != new.agent.budget,
@@ -373,5 +377,38 @@ max_tokens_per_day = 100000
         assert!(!diff.security_changed);
         assert!(!diff.debounce_changed);
         assert!(diff.restart_required.is_empty());
+    }
+
+    #[test]
+    fn test_diff_injection_requires_restart() {
+        let old = config::parse_config(
+            r#"
+[agent]
+model = "test"
+api_key = "key"
+[security.injection]
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        let new = config::parse_config(
+            r#"
+[agent]
+model = "test"
+api_key = "key"
+[security.injection]
+enabled = true
+action = "block"
+"#,
+        )
+        .unwrap();
+
+        let diff = diff_configs(&old, &new);
+        assert!(diff.security_changed);
+        assert!(
+            diff.restart_required.contains(&"security.injection"),
+            "Injection config changes should require restart"
+        );
     }
 }
