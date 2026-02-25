@@ -219,6 +219,10 @@ async fn run_inspect(
 // ---------------------------------------------------------------------------
 
 async fn run_main(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let config_file_path = match config_path {
+        Some(p) => p.to_path_buf(),
+        None => yoclaw::config::config_dir().join("config.toml"),
+    };
     let config = yoclaw::config::load_config(config_path)?;
     let db_path = config.db_path();
     let db = yoclaw::db::Db::open(&db_path)?;
@@ -257,6 +261,7 @@ async fn run_main(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
         coalesced_tx,
     )
     .with_channel_debounce(channel_debounce);
+    let shared_debounce = coalescer.shared_debounce();
     tokio::spawn(coalescer.run());
 
     // Collect adapters for sending responses (Arc for sharing with scheduler delivery)
@@ -345,10 +350,33 @@ async fn run_main(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
         std::process::exit(0);
     });
 
+    // Config hot-reload watcher (polls every 5 seconds)
+    let mut config_watcher = yoclaw::watcher::ConfigWatcher::new(config_file_path);
+    let mut current_config = config;
+    let mut reload_interval = tokio::time::interval(Duration::from_secs(5));
+    reload_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     tracing::info!("yoclaw running. Waiting for messages...");
 
     // Process loop
-    while let Some(incoming) = coalesced_rx.recv().await {
+    loop {
+        tokio::select! {
+            // Config hot-reload poll
+            _ = reload_interval.tick() => {
+                if let Some(new_config) = config_watcher.check() {
+                    let diff = yoclaw::watcher::diff_configs(&current_config, &new_config);
+                    yoclaw::watcher::apply_hot_reload(&diff, &new_config, &mut conductor, &shared_debounce);
+                    current_config = new_config;
+                }
+                continue;
+            }
+            // Incoming message
+            msg = coalesced_rx.recv() => {
+                let incoming = match msg {
+                    Some(m) => m,
+                    None => break, // channel closed
+                };
+
         let queue_entry = yoclaw::db::queue::QueueEntry::new(
             &incoming.channel,
             &incoming.sender_id,
@@ -365,15 +393,56 @@ async fn run_main(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
             truncate(&incoming.content, 80)
         );
 
+        // Start typing indicator
+        let typing_handle = adapters
+            .iter()
+            .find(|a| a.name() == incoming.channel)
+            .and_then(|a| a.start_typing(&incoming.session_id));
+
+        // Build progress callback to route send_message tool output to the channel
+        let on_progress: Option<Box<dyn Fn(String) + Send + Sync>> = {
+            let adapter = adapters
+                .iter()
+                .find(|a| a.name() == incoming.channel)
+                .cloned();
+            if let Some(adapter) = adapter {
+                let channel = incoming.channel.clone();
+                let session_id = incoming.session_id.clone();
+                Some(Box::new(move |text: String| {
+                    let outgoing = yoclaw::channels::OutgoingMessage {
+                        channel: channel.clone(),
+                        session_id: session_id.clone(),
+                        content: text,
+                        reply_to: None,
+                    };
+                    let adapter = adapter.clone();
+                    tokio::spawn(async move {
+                        let _ = adapter.send(outgoing).await;
+                    });
+                }))
+            } else {
+                None
+            }
+        };
+
         let result = if let Some(ref worker_name) = incoming.worker_hint {
             conductor
                 .delegate_to_worker(&incoming.session_id, worker_name, &incoming.content)
                 .await
+        } else if incoming.is_group {
+            conductor
+                .process_group_message(&incoming.session_id, &incoming.content, on_progress)
+                .await
         } else {
             conductor
-                .process_message(&incoming.session_id, &incoming.content)
+                .process_message(&incoming.session_id, &incoming.content, on_progress)
                 .await
         };
+
+        // Stop typing indicator
+        if let Some(handle) = typing_handle {
+            handle.abort();
+        }
 
         match result {
             Ok(response) => {
@@ -408,7 +477,9 @@ async fn run_main(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
                 db.queue_mark_failed(queue_id, &e.to_string()).await?;
             }
         }
-    }
+            } // end select msg arm
+        } // end select
+    } // end loop
 
     Ok(())
 }

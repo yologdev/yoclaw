@@ -237,10 +237,7 @@ mod tests {
 
         // List jobs
         let result = tool
-            .execute(
-                serde_json::json!({ "action": "list" }),
-                test_ctx(),
-            )
+            .execute(serde_json::json!({ "action": "list" }), test_ctx())
             .await
             .unwrap();
         let text = content_text(&result.content[0]);

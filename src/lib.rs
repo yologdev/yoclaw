@@ -6,4 +6,5 @@ pub mod migrate;
 pub mod scheduler;
 pub mod security;
 pub mod skills;
+pub mod watcher;
 pub mod web;

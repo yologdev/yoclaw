@@ -1,4 +1,5 @@
 pub mod budget;
+pub mod injection;
 
 use crate::config::SecurityConfig;
 use crate::db::Db;
@@ -138,7 +139,7 @@ impl SecurityPolicy {
 /// Wraps an AgentTool with security policy checks.
 pub struct SecureToolWrapper {
     pub inner: Box<dyn yoagent::AgentTool>,
-    pub policy: Arc<SecurityPolicy>,
+    pub policy: Arc<std::sync::RwLock<SecurityPolicy>>,
     pub db: Db,
     pub session_id: Arc<std::sync::RwLock<String>>,
 }
@@ -166,10 +167,13 @@ impl yoagent::AgentTool for SecureToolWrapper {
         params: serde_json::Value,
         ctx: yoagent::types::ToolContext,
     ) -> Result<yoagent::ToolResult, yoagent::ToolError> {
-        // Check security policy
-        if let Err(denied) = self.policy.check_tool_call(self.inner.name(), &params) {
+        // Check security policy (scoped to drop read guard before await)
+        let denied = {
+            let policy = self.policy.read().unwrap();
+            policy.check_tool_call(self.inner.name(), &params).err()
+        };
+        if let Some(denied) = denied {
             let session = self.session_id.read().unwrap().clone();
-            // Log the denial
             let _ = self
                 .db
                 .audit_log(
@@ -208,7 +212,7 @@ impl yoagent::AgentTool for SecureToolWrapper {
 /// Wrap a list of tools with security policy enforcement.
 pub fn wrap_tools(
     tools: Vec<Box<dyn yoagent::AgentTool>>,
-    policy: Arc<SecurityPolicy>,
+    policy: Arc<std::sync::RwLock<SecurityPolicy>>,
     db: Db,
     session_id: Arc<std::sync::RwLock<String>>,
 ) -> Vec<Box<dyn yoagent::AgentTool>> {

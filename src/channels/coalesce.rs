@@ -1,13 +1,22 @@
 use super::IncomingMessage;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
+
+/// Shared debounce configuration that can be updated at runtime.
+pub type SharedDebounce = Arc<RwLock<DebounceConfig>>;
+
+/// Debounce timing configuration.
+pub struct DebounceConfig {
+    pub default: Duration,
+    pub per_channel: HashMap<String, Duration>,
+}
 
 /// Batches rapid-fire messages from the same session into a single message.
 /// Supports per-channel debounce overrides.
 pub struct MessageCoalescer {
-    default_debounce: Duration,
-    channel_debounce: HashMap<String, Duration>,
+    debounce: SharedDebounce,
     input_rx: mpsc::UnboundedReceiver<IncomingMessage>,
     output_tx: mpsc::UnboundedSender<IncomingMessage>,
 }
@@ -19,24 +28,33 @@ impl MessageCoalescer {
         output_tx: mpsc::UnboundedSender<IncomingMessage>,
     ) -> Self {
         Self {
-            default_debounce,
-            channel_debounce: HashMap::new(),
+            debounce: Arc::new(RwLock::new(DebounceConfig {
+                default: default_debounce,
+                per_channel: HashMap::new(),
+            })),
             input_rx,
             output_tx,
         }
     }
 
     /// Set per-channel debounce overrides.
-    pub fn with_channel_debounce(mut self, overrides: HashMap<String, Duration>) -> Self {
-        self.channel_debounce = overrides;
+    pub fn with_channel_debounce(self, overrides: HashMap<String, Duration>) -> Self {
+        self.debounce.write().unwrap().per_channel = overrides;
         self
     }
 
+    /// Get a handle to the shared debounce config for hot-reload.
+    pub fn shared_debounce(&self) -> SharedDebounce {
+        self.debounce.clone()
+    }
+
     fn debounce_for(&self, channel: &str) -> Duration {
-        self.channel_debounce
+        let config = self.debounce.read().unwrap();
+        config
+            .per_channel
             .get(channel)
             .copied()
-            .unwrap_or(self.default_debounce)
+            .unwrap_or(config.default)
     }
 
     /// Run the coalescer loop. Blocks until the input channel is closed.
@@ -121,6 +139,7 @@ fn coalesce_messages(mut messages: Vec<IncomingMessage>) -> IncomingMessage {
         reply_to: first.reply_to.clone(),
         timestamp: first.timestamp,
         worker_hint: first.worker_hint.clone(),
+        is_group: first.is_group,
     }
 }
 
@@ -143,6 +162,7 @@ mod tests {
             reply_to: None,
             timestamp: now_ms(),
             worker_hint: None,
+            is_group: false,
         }
     }
 

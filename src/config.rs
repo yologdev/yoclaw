@@ -18,7 +18,7 @@ pub enum ConfigError {
 // Top-level config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct Config {
     pub agent: AgentConfig,
     #[serde(default)]
@@ -37,7 +37,7 @@ pub struct Config {
 // Agent
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct AgentConfig {
     /// Provider name: "anthropic", "openai", "google", etc.
     #[serde(default = "default_provider")]
@@ -69,13 +69,13 @@ pub struct AgentConfig {
     pub context: ContextConfig,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone, PartialEq)]
 pub struct BudgetConfig {
     pub max_tokens_per_day: Option<u64>,
     pub max_turns_per_session: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone, PartialEq)]
 pub struct WorkersConfig {
     /// Default provider for workers
     pub provider: Option<String>,
@@ -89,7 +89,7 @@ pub struct WorkersConfig {
     pub named: HashMap<String, WorkerConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct WorkerConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -103,14 +103,14 @@ pub struct WorkerConfig {
 // Channels
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone, PartialEq)]
 pub struct ChannelsConfig {
     pub telegram: Option<TelegramConfig>,
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct TelegramConfig {
     pub bot_token: String,
     #[serde(default)]
@@ -119,7 +119,7 @@ pub struct TelegramConfig {
     pub debounce_ms: u64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct DiscordConfig {
     pub bot_token: String,
     #[serde(default)]
@@ -133,12 +133,12 @@ pub struct DiscordConfig {
     pub routing: HashMap<String, ChannelRoute>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct ChannelRoute {
     pub worker: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct SlackConfig {
     /// Bot token (xoxb-...)
     pub bot_token: String,
@@ -156,7 +156,7 @@ pub struct SlackConfig {
 // Persistence
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct PersistenceConfig {
     #[serde(default = "default_db_path")]
     pub db_path: String,
@@ -174,15 +174,40 @@ impl Default for PersistenceConfig {
 // Security
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone, PartialEq)]
 pub struct SecurityConfig {
     #[serde(default)]
     pub shell_deny_patterns: Vec<String>,
     #[serde(default)]
     pub tools: HashMap<String, ToolPermission>,
+    #[serde(default)]
+    pub injection: InjectionConfig,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct InjectionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Action on detection: "warn" (append warning, let through), "block" (reject),
+    /// or "log" (pass through, audit log only). Default: "warn".
+    #[serde(default = "default_injection_action")]
+    pub action: String,
+    /// Additional patterns to match (appended to built-in set).
+    #[serde(default)]
+    pub extra_patterns: Vec<String>,
+}
+
+impl Default for InjectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            action: default_injection_action(),
+            extra_patterns: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct ToolPermission {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -198,18 +223,22 @@ pub struct ToolPermission {
 // Context
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone, PartialEq)]
 pub struct ContextConfig {
     pub max_context_tokens: Option<u64>,
     pub keep_recent: Option<usize>,
     pub tool_output_max_lines: Option<usize>,
+    /// For group chats: max messages to load since the last assistant reply.
+    /// Prevents loading very large backlogs. Default: 50.
+    #[serde(default = "default_max_group_catchup")]
+    pub max_group_catchup_messages: usize,
 }
 
 // ---------------------------------------------------------------------------
 // Web UI
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct WebConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -233,7 +262,7 @@ impl Default for WebConfig {
 // Scheduler
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct SchedulerConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -256,7 +285,7 @@ impl Default for SchedulerConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct CortexConfig {
     #[serde(default = "default_cortex_interval")]
     pub interval_hours: u64,
@@ -273,13 +302,13 @@ impl Default for CortexConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone, PartialEq)]
 pub struct CronConfig {
     #[serde(default)]
     pub jobs: Vec<CronJobConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct CronJobConfig {
     pub name: String,
     pub schedule: String,
@@ -332,6 +361,14 @@ fn default_cortex_model() -> String {
 
 fn default_session_mode() -> String {
     "isolated".to_string()
+}
+
+fn default_max_group_catchup() -> usize {
+    50
+}
+
+fn default_injection_action() -> String {
+    "warn".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -713,5 +750,39 @@ target = "telegram"
         let job2 = &config.scheduler.cron.jobs[1];
         assert_eq!(job2.name, "evening-summary");
         assert_eq!(job2.session, "isolated"); // default
+    }
+
+    #[test]
+    fn test_parse_injection_config() {
+        let toml = r#"
+[agent]
+model = "test"
+api_key = "key"
+
+[security.injection]
+enabled = true
+action = "block"
+extra_patterns = ["custom injection"]
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(config.security.injection.enabled);
+        assert_eq!(config.security.injection.action, "block");
+        assert_eq!(
+            config.security.injection.extra_patterns,
+            vec!["custom injection"]
+        );
+    }
+
+    #[test]
+    fn test_injection_config_defaults() {
+        let toml = r#"
+[agent]
+model = "test"
+api_key = "key"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(!config.security.injection.enabled);
+        assert_eq!(config.security.injection.action, "warn");
+        assert!(config.security.injection.extra_patterns.is_empty());
     }
 }

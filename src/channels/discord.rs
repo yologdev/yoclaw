@@ -74,6 +74,7 @@ impl EventHandler for Handler {
                 .map(|m| m.id.get().to_string()),
             timestamp: now_ms(),
             worker_hint,
+            is_group: msg.guild_id.is_some(),
         };
 
         let _ = self.tx.send(incoming);
