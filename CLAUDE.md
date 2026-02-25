@@ -34,10 +34,10 @@ Channel (Telegram/Discord/Slack) → MessageCoalescer (debounce) → Queue (SQLi
 
 ### Module responsibilities
 
-- **conductor/** — Owns the yoagent `Agent`. Handles session switching, drains `AgentEvent` stream, persists to tape. `delegate.rs` builds `SubAgentTool` workers from config. `tools.rs` implements `MemorySearchTool`/`MemoryStoreTool`. `direct_workers` HashMap enables direct worker delegation bypassing the main agent.
+- **conductor/** — Owns the yoagent `Agent`. Handles session switching, drains `AgentEvent` stream, persists to tape. `resolve_provider()` returns `DynProvider(Box<dyn StreamProvider>)` to support multiple LLM providers (anthropic, openai, google, vertex, azure, bedrock, openai_responses). `delegate.rs` builds `SubAgentTool` workers from config. `tools.rs` implements `MemorySearchTool`/`MemoryStoreTool`. `direct_workers` HashMap enables direct worker delegation bypassing the main agent.
 - **channels/** — `ChannelAdapter` trait (`Send + Sync`, stored as `Arc<dyn ChannelAdapter>`) for messaging platforms. `telegram.rs` (teloxide), `discord.rs` (serenity), `slack.rs` (Socket Mode). `coalesce.rs` debounces rapid messages per session with per-channel configurable debounce.
-- **db/** — `Db` wraps `Arc<Mutex<Connection>>`. All methods use `spawn_blocking` for async safety. Tables: tape, queue, memory (+ FTS5), audit, state, cron_jobs, cron_runs.
-- **scheduler/** — Unified scheduler for cortex maintenance and cron jobs. `cortex.rs` handles memory dedup, stale cleanup, consolidation, session indexing. `cron.rs` runs due jobs via ephemeral agents. `tools.rs` provides `CronScheduleTool` for conversational cron management.
+- **db/** — `Db` wraps `Arc<Mutex<Connection>>`. All methods use `spawn_blocking` for async safety. Tables: tape, queue, memory (+ FTS5), audit, state, cron_jobs, cron_runs. `vector.rs` (behind `semantic` feature flag) provides `EmbeddingEngine` (embedding-gemma-300m) and sqlite-vec KNN search; `memory.rs` uses RRF (Reciprocal Rank Fusion) to merge FTS5 and vector results, then applies temporal decay weighted by RRF scores.
+- **scheduler/** — Unified scheduler for cortex maintenance and cron jobs. `cortex.rs` handles memory dedup, stale cleanup, consolidation, session indexing. `cron.rs` runs due jobs via ephemeral or persistent agents based on session mode. `tools.rs` provides `CronScheduleTool` for conversational cron management.
 - **security/** — `SecureToolWrapper` wraps every `AgentTool`, checks `SecurityPolicy` before delegating. `BudgetTracker` uses `AtomicU64` for sync compatibility with yoagent's `on_before_turn` callback.
 - **skills/** — Loads `SKILL.md` files, parses `tools` from YAML frontmatter, filters out skills requiring disabled tools.
 - **web/** — Embedded web UI via rust-embed (`web/dist/`). Axum server with REST API (`/api/sessions`, `/api/queue`, `/api/budget`, `/api/audit`) and SSE (`/api/events`).
@@ -52,6 +52,7 @@ Channel (Telegram/Discord/Slack) → MessageCoalescer (debounce) → Queue (SQLi
 - Workers use `SubAgentTool` (ephemeral: fresh `agent_loop` per invocation)
 - Direct worker delegation: `delegate_to_worker` calls `SubAgentTool::execute` directly, persists exchange to tape, invalidates session
 - Ephemeral agents: `run_ephemeral_prompt()` in `scheduler/mod.rs` uses `agent_loop` directly for cron/cortex tasks; `AgentLoopConfig` requires `input_filters` field
+- Persistent agents: `run_persistent_prompt()` loads prior conversation from tape, runs `agent_loop` (max 5 turns), saves back — used by cron jobs with `session_mode = "persistent"`
 - Default tools from `yoagent::tools::default_tools()` are wrapped with `SecureToolWrapper`
 - Direct workers are NOT wrapped in `SecureToolWrapper` — their inner tools are already secured; wrapping the SubAgentTool itself would audit under the worker name, not a real tool name
 

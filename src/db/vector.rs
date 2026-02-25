@@ -165,7 +165,8 @@ pub fn vec_table_exists(conn: &rusqlite::Connection) -> bool {
     .is_ok()
 }
 
-/// Insert (or replace) an embedding for a memory entry.
+/// Insert or update an embedding for a memory entry.
+/// Uses DELETE + INSERT since vec0 virtual tables may not support INSERT OR REPLACE.
 pub fn vec_insert(
     conn: &rusqlite::Connection,
     memory_id: i64,
@@ -173,7 +174,11 @@ pub fn vec_insert(
 ) -> Result<(), rusqlite::Error> {
     let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
     conn.execute(
-        "INSERT OR REPLACE INTO memory_vec (memory_id, embedding) VALUES (?1, ?2)",
+        "DELETE FROM memory_vec WHERE memory_id = ?1",
+        rusqlite::params![memory_id],
+    )?;
+    conn.execute(
+        "INSERT INTO memory_vec (memory_id, embedding) VALUES (?1, ?2)",
         rusqlite::params![memory_id, blob],
     )?;
     Ok(())

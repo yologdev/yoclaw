@@ -57,8 +57,8 @@ impl AgentTool for CronScheduleTool {
                 },
                 "session": {
                     "type": "string",
-                    "description": "Session mode: 'isolated' (fresh session per run) or 'main' (inject into current session)",
-                    "enum": ["isolated", "main"]
+                    "description": "Session mode: 'isolated' (fresh session per run) or 'persistent' (maintain conversation history across runs)",
+                    "enum": ["isolated", "persistent"]
                 },
                 "enabled": {
                     "type": "boolean",

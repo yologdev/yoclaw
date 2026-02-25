@@ -106,6 +106,15 @@ impl Db {
     pub async fn memory_delete(&self, id: i64) -> Result<(), DbError> {
         self.exec(move |conn| {
             conn.execute("DELETE FROM memory WHERE id = ?1", rusqlite::params![id])?;
+
+            // Clean up vector embedding if semantic feature is enabled
+            #[cfg(feature = "semantic")]
+            {
+                if super::vector::vec_table_exists(conn) {
+                    super::vector::vec_delete(conn, id).ok();
+                }
+            }
+
             Ok(())
         })
         .await
@@ -218,7 +227,7 @@ fn memory_search_sync(
 
     // 2. Optionally run vector KNN search and merge with RRF
     #[cfg(feature = "semantic")]
-    let mut entries = {
+    let (mut entries, rrf_scores) = {
         if super::vector::vec_table_exists(conn) {
             if let Ok(engine) = super::vector::EmbeddingEngine::global() {
                 if let Ok(emb) = engine.embed(&[query]) {
@@ -253,35 +262,49 @@ fn memory_search_sync(
                             }
                         }
 
+                        // Build RRF score lookup for decay weighting
+                        let rrf_scores: HashMap<i64, f64> =
+                            merged.iter().map(|&(id, score)| (id, score)).collect();
+
                         // Reorder by RRF score
-                        merged
+                        let results: Vec<_> = merged
                             .into_iter()
                             .filter_map(|(id, _)| entry_map.remove(&id))
-                            .collect::<Vec<_>>()
+                            .collect();
+                        (results, rrf_scores)
                     } else {
-                        fts_entries
+                        (fts_entries, HashMap::new())
                     }
                 } else {
-                    fts_entries
+                    (fts_entries, HashMap::new())
                 }
             } else {
-                fts_entries
+                (fts_entries, HashMap::new())
             }
         } else {
-            fts_entries
+            (fts_entries, HashMap::new())
         }
     };
 
     #[cfg(not(feature = "semantic"))]
     let mut entries = fts_entries;
 
-    // 3. Apply temporal decay and re-rank
+    // 3. Apply temporal decay and re-rank (using RRF scores as base when available)
     let now = now_ms();
     entries.sort_by(|a, b| {
         let age_a = (now.saturating_sub(a.updated_at)) as f64 / (1000.0 * 60.0 * 60.0 * 24.0);
         let age_b = (now.saturating_sub(b.updated_at)) as f64 / (1000.0 * 60.0 * 60.0 * 24.0);
-        let score_a = apply_decay(1.0, age_a, &a.category);
-        let score_b = apply_decay(1.0, age_b, &b.category);
+        #[cfg(feature = "semantic")]
+        let (base_a, base_b) = (
+            a.id.and_then(|id| rrf_scores.get(&id).copied())
+                .unwrap_or(1.0),
+            b.id.and_then(|id| rrf_scores.get(&id).copied())
+                .unwrap_or(1.0),
+        );
+        #[cfg(not(feature = "semantic"))]
+        let (base_a, base_b) = (1.0, 1.0);
+        let score_a = apply_decay(base_a, age_a, &a.category);
+        let score_b = apply_decay(base_b, age_b, &b.category);
         score_b
             .partial_cmp(&score_a)
             .unwrap_or(std::cmp::Ordering::Equal)
