@@ -59,6 +59,25 @@ async fn cleanup_stale_memories(db: &Db) -> Result<usize, DbError> {
     let cutoff = now.saturating_sub(ninety_days_ms) as i64;
 
     db.exec(move |conn| {
+        // Clean up vector embeddings before deleting memories
+        #[cfg(feature = "semantic")]
+        {
+            if crate::db::vector::vec_table_exists(conn) {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM memory WHERE importance <= 3
+                     AND (last_accessed IS NOT NULL AND last_accessed < ?1)
+                     AND category != 'decision'",
+                )?;
+                let ids: Vec<i64> = stmt
+                    .query_map(rusqlite::params![cutoff], |r| r.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                for id in &ids {
+                    crate::db::vector::vec_delete(conn, *id).ok();
+                }
+            }
+        }
+
         let deleted = conn.execute(
             "DELETE FROM memory WHERE importance <= 3
              AND (last_accessed IS NOT NULL AND last_accessed < ?1)
@@ -73,6 +92,25 @@ async fn cleanup_stale_memories(db: &Db) -> Result<usize, DbError> {
 /// Remove exact duplicate memory entries (keep the most recently updated).
 async fn deduplicate_memories(db: &Db) -> Result<usize, DbError> {
     db.exec(|conn| {
+        // Clean up vector embeddings before deleting duplicate memories
+        #[cfg(feature = "semantic")]
+        {
+            if crate::db::vector::vec_table_exists(conn) {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM memory WHERE id NOT IN (
+                        SELECT MAX(id) FROM memory GROUP BY content
+                    )",
+                )?;
+                let ids: Vec<i64> = stmt
+                    .query_map([], |r| r.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                for id in &ids {
+                    crate::db::vector::vec_delete(conn, *id).ok();
+                }
+            }
+        }
+
         let deleted = conn.execute(
             "DELETE FROM memory WHERE id NOT IN (
                 SELECT MAX(id) FROM memory GROUP BY content

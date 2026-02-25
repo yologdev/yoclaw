@@ -9,7 +9,7 @@ use crate::skills::LoadedSkill;
 use delegate::WorkerInfo;
 use std::collections::HashMap;
 use std::sync::Arc;
-use yoagent::provider::AnthropicProvider;
+use yoagent::provider;
 use yoagent::types::*;
 use yoagent::Agent;
 
@@ -516,17 +516,37 @@ async fn drain_response(
     }
 }
 
+/// Wrapper that allows `resolve_provider` to return different provider types
+/// as a single concrete type that implements `StreamProvider`.
+pub struct DynProvider(Box<dyn provider::StreamProvider>);
+
+#[async_trait::async_trait]
+impl provider::StreamProvider for DynProvider {
+    async fn stream(
+        &self,
+        config: provider::StreamConfig,
+        tx: tokio::sync::mpsc::UnboundedSender<provider::StreamEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message, provider::ProviderError> {
+        self.0.stream(config, tx, cancel).await
+    }
+}
+
 /// Resolve a provider name to a StreamProvider implementation.
-pub fn resolve_provider(name: &str) -> impl yoagent::provider::StreamProvider + 'static {
-    // For now, always return AnthropicProvider.
-    // TODO: support openai, google, etc. via ProviderRegistry
-    match name {
-        "anthropic" => AnthropicProvider,
+pub fn resolve_provider(name: &str) -> DynProvider {
+    DynProvider(match name {
+        "anthropic" => Box::new(provider::AnthropicProvider),
+        "openai" => Box::new(provider::OpenAiCompatProvider),
+        "google" => Box::new(provider::GoogleProvider),
+        "vertex" => Box::new(provider::GoogleVertexProvider),
+        "azure" => Box::new(provider::AzureOpenAiProvider),
+        "bedrock" => Box::new(provider::BedrockProvider),
+        "openai_responses" => Box::new(provider::OpenAiResponsesProvider),
         _ => {
             tracing::warn!("Unknown provider '{}', defaulting to anthropic", name);
-            AnthropicProvider
+            Box::new(provider::AnthropicProvider)
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -889,5 +909,21 @@ api_key = "test-key"
         } else {
             panic!("Expected user message as first message");
         }
+    }
+
+    #[test]
+    fn test_resolve_provider_anthropic() {
+        let _p = resolve_provider("anthropic");
+    }
+
+    #[test]
+    fn test_resolve_provider_openai() {
+        let _p = resolve_provider("openai");
+    }
+
+    #[test]
+    fn test_resolve_provider_unknown_defaults() {
+        // Unknown name should not panic — falls back to anthropic
+        let _p = resolve_provider("some-unknown-provider");
     }
 }
