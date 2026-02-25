@@ -232,9 +232,10 @@ pub async fn run_persistent_prompt(
     system_prompt: &str,
     task: &str,
 ) -> Result<String, anyhow::Error> {
+    use crate::conductor::compaction::MemoryAwareCompaction;
     use crate::conductor::resolve_provider;
     use yoagent::agent_loop::{agent_loop, AgentLoopConfig};
-    use yoagent::context::ExecutionLimits;
+    use yoagent::context::{ContextConfig, ExecutionLimits};
     use yoagent::types::*;
 
     // 1. Load prior messages from tape
@@ -251,6 +252,9 @@ pub async fn run_persistent_prompt(
         tools: Vec::new(),
     };
 
+    let session_id_ref = std::sync::Arc::new(std::sync::RwLock::new(session_id.to_string()));
+    let compaction = MemoryAwareCompaction::new(db.clone(), session_id_ref);
+
     let config = AgentLoopConfig {
         provider: provider_ref,
         model: agent_config.model.clone(),
@@ -262,8 +266,14 @@ pub async fn run_persistent_prompt(
         transform_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
-        context_config: None,
-        compaction_strategy: None,
+        context_config: Some(ContextConfig {
+            max_context_tokens: 80_000,
+            system_prompt_tokens: 1_000,
+            keep_recent: 6,
+            keep_first: 2,
+            tool_output_max_lines: 30,
+        }),
+        compaction_strategy: Some(std::sync::Arc::new(compaction)),
         input_filters: Vec::new(),
         execution_limits: Some(ExecutionLimits {
             max_turns: 5,

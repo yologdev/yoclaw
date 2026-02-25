@@ -120,6 +120,30 @@ impl Db {
         .await
     }
 
+    /// Store compacted conversation context as a memory entry (sync, for compaction).
+    /// Uses `exec_sync` since `CompactionStrategy::compact()` is a sync call.
+    pub fn memory_store_compacted(
+        &self,
+        content: &str,
+        source: &str,
+        dropped_count: usize,
+    ) -> Result<i64, DbError> {
+        let ts = now_ms();
+        let tags = format!("compaction,dropped:{}", dropped_count);
+        self.exec_sync(|conn| {
+            memory_store_sync(
+                conn,
+                None,
+                content,
+                Some(&tags),
+                Some(source),
+                "context",
+                3,
+                ts,
+            )
+        })
+    }
+
     /// Update access tracking for a set of memory IDs (called after search results are returned).
     pub async fn memory_touch(&self, ids: Vec<i64>) -> Result<(), DbError> {
         let ts = now_ms();
