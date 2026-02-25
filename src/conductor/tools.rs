@@ -46,10 +46,8 @@ impl AgentTool for MemorySearchTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
         params: serde_json::Value,
-        _cancel: tokio_util::sync::CancellationToken,
-        _on_update: Option<ToolUpdateFn>,
+        _ctx: ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let query = params["query"]
             .as_str()
@@ -155,10 +153,8 @@ impl AgentTool for MemoryStoreTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
         params: serde_json::Value,
-        _cancel: tokio_util::sync::CancellationToken,
-        _on_update: Option<ToolUpdateFn>,
+        _ctx: ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let content = params["content"]
             .as_str()
@@ -193,20 +189,27 @@ mod tests {
     use super::*;
     use crate::db::Db;
 
+    fn test_ctx() -> ToolContext {
+        ToolContext {
+            tool_call_id: "test".to_string(),
+            tool_name: "test".to_string(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            on_update: None,
+            on_progress: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_memory_store_and_search() {
         let db = Db::open_memory().unwrap();
         let store = MemoryStoreTool::new(db.clone());
         let search = MemorySearchTool::new(db);
-        let cancel = tokio_util::sync::CancellationToken::new();
 
         // Store
         let result = store
             .execute(
-                "1",
                 serde_json::json!({"content": "User prefers dark mode", "key": "theme", "tags": "preference"}),
-                cancel.clone(),
-                None,
+                test_ctx(),
             )
             .await
             .unwrap();
@@ -214,7 +217,7 @@ mod tests {
 
         // Search
         let result = search
-            .execute("2", serde_json::json!({"query": "dark mode"}), cancel, None)
+            .execute(serde_json::json!({"query": "dark mode"}), test_ctx())
             .await
             .unwrap();
         assert!(content_text(&result.content[0]).contains("dark mode"));
@@ -224,18 +227,15 @@ mod tests {
     async fn test_memory_store_with_category() {
         let db = Db::open_memory().unwrap();
         let store = MemoryStoreTool::new(db.clone());
-        let cancel = tokio_util::sync::CancellationToken::new();
 
         let result = store
             .execute(
-                "1",
                 serde_json::json!({
                     "content": "Always use bun instead of npm",
                     "category": "decision",
                     "importance": 9
                 }),
-                cancel,
-                None,
+                test_ctx(),
             )
             .await
             .unwrap();

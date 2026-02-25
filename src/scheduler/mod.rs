@@ -183,6 +183,7 @@ pub async fn run_ephemeral_prompt(
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: None,
+        input_filters: Vec::new(),
         execution_limits: Some(ExecutionLimits {
             max_turns: 1,
             max_total_tokens: 100_000,

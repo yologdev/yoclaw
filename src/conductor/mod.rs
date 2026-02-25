@@ -282,11 +282,17 @@ impl Conductor {
         *self.session_id_ref.write().unwrap() = session_id.to_string();
 
         // Execute the worker's sub-agent directly
-        let cancel = tokio_util::sync::CancellationToken::new();
         let params = serde_json::json!({"task": text});
+        let ctx = ToolContext {
+            tool_call_id: "direct-delegate".to_string(),
+            tool_name: worker_name.to_string(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            on_update: None,
+            on_progress: None,
+        };
         let worker_tool = self.direct_workers.get(worker_name).unwrap();
         let result = worker_tool
-            .execute("direct-delegate", params, cancel, None)
+            .execute(params, ctx)
             .await
             .map_err(|e| anyhow::anyhow!("Worker '{}' failed: {:?}", worker_name, e))?;
 
