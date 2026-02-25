@@ -183,6 +183,7 @@ pub async fn run_ephemeral_prompt(
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: None,
+        compaction_strategy: None,
         input_filters: Vec::new(),
         execution_limits: Some(ExecutionLimits {
             max_turns: 1,
@@ -205,6 +206,89 @@ pub async fn run_ephemeral_prompt(
 
     // Extract text from the last assistant message
     for msg in messages.iter().rev() {
+        if let AgentMessage::Llm(Message::Assistant { content, .. }) = msg {
+            let texts: Vec<&str> = content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if !texts.is_empty() {
+                return Ok(texts.join("\n"));
+            }
+        }
+    }
+
+    Ok("(no response)".to_string())
+}
+
+/// Run a persistent agent: loads prior conversation from tape, appends the new prompt,
+/// runs agent_loop, then saves the full conversation back.
+pub async fn run_persistent_prompt(
+    db: &Db,
+    agent_config: &AgentRunConfig,
+    session_id: &str,
+    system_prompt: &str,
+    task: &str,
+) -> Result<String, anyhow::Error> {
+    use crate::conductor::resolve_provider;
+    use yoagent::agent_loop::{agent_loop, AgentLoopConfig};
+    use yoagent::context::ExecutionLimits;
+    use yoagent::types::*;
+
+    // 1. Load prior messages from tape
+    let mut prompts = db.tape_load_messages(session_id).await?;
+    // 2. Append new user message
+    prompts.push(AgentMessage::Llm(Message::user(task)));
+
+    let provider = resolve_provider(&agent_config.provider);
+    let provider_ref: &dyn yoagent::provider::StreamProvider = &provider;
+
+    let mut context = AgentContext {
+        system_prompt: system_prompt.to_string(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+    };
+
+    let config = AgentLoopConfig {
+        provider: provider_ref,
+        model: agent_config.model.clone(),
+        api_key: agent_config.api_key.clone(),
+        thinking_level: ThinkingLevel::Off,
+        max_tokens: None,
+        temperature: None,
+        convert_to_llm: None,
+        transform_context: None,
+        get_steering_messages: None,
+        get_follow_up_messages: None,
+        context_config: None,
+        compaction_strategy: None,
+        input_filters: Vec::new(),
+        execution_limits: Some(ExecutionLimits {
+            max_turns: 5,
+            max_total_tokens: 100_000,
+            max_duration: std::time::Duration::from_secs(120),
+        }),
+        cache_config: CacheConfig::default(),
+        tool_execution: ToolExecutionStrategy::default(),
+        retry_config: yoagent::RetryConfig::default(),
+        before_turn: None,
+        after_turn: None,
+        on_error: None,
+    };
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    // 3. Run agent_loop — returns prompts + all new messages
+    let all_messages = agent_loop(prompts, &mut context, &config, tx, cancel).await;
+
+    // 4. Save full conversation back to tape
+    db.tape_save_messages(session_id, &all_messages).await?;
+
+    // 5. Extract text from the last assistant message
+    for msg in all_messages.iter().rev() {
         if let AgentMessage::Llm(Message::Assistant { content, .. }) = msg {
             let texts: Vec<&str> = content
                 .iter()

@@ -29,14 +29,11 @@ pub async fn check_and_run_due_jobs(
     let mut ran = 0;
 
     for job in jobs {
-        if job.session_mode != "isolated" {
-            tracing::warn!(
-                "Cron job '{}' has session_mode '{}' which is not yet implemented; running in isolated mode",
-                job.name,
-                job.session_mode
-            );
-        }
-        tracing::info!("Cron job '{}' is due, executing...", job.name);
+        tracing::info!(
+            "Cron job '{}' is due, executing... (mode: {})",
+            job.name,
+            job.session_mode
+        );
 
         let started_at = now_ms() as i64;
         let job_id = job.id;
@@ -53,13 +50,32 @@ pub async fn check_and_run_due_jobs(
             })
             .await?;
 
-        // Run an ephemeral agent with the job's prompt
-        let result = super::run_ephemeral_prompt(
-            agent_config,
-            "You are a scheduled task agent. Execute the following task concisely.",
-            &job.prompt,
-        )
-        .await;
+        // Execute based on session mode
+        let session_id = format!("cron-{}", job.name);
+        let system_prompt = "You are a scheduled task agent. Execute the following task concisely.";
+
+        let result = match job.session_mode.as_str() {
+            "persistent" => {
+                super::run_persistent_prompt(
+                    db,
+                    agent_config,
+                    &session_id,
+                    system_prompt,
+                    &job.prompt,
+                )
+                .await
+            }
+            _ => {
+                if job.session_mode != "isolated" {
+                    tracing::warn!(
+                        "Cron job '{}' has unknown session_mode '{}'; using isolated",
+                        job.name,
+                        job.session_mode
+                    );
+                }
+                super::run_ephemeral_prompt(agent_config, system_prompt, &job.prompt).await
+            }
+        };
 
         match result {
             Ok(response) => {
@@ -443,5 +459,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_persistent_mode_dispatch() {
+        let db = Db::open_memory().unwrap();
+        let agent = test_agent_config();
+
+        // Create a persistent-mode job
+        create_job(
+            &db,
+            "persistent-job",
+            "* * * * *",
+            "check status",
+            None,
+            "persistent",
+        )
+        .await
+        .unwrap();
+
+        // Backdate so it's due
+        let old_ts = (now_ms() - 25 * 60 * 60 * 1000) as i64;
+        db.exec(move |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET updated_at = ?1 WHERE name = 'persistent-job'",
+                rusqlite::params![old_ts],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Will fail at provider level (fake API key), but should record run attempt
+        let ran = check_and_run_due_jobs(&db, &agent, None).await.unwrap();
+        assert_eq!(ran, 1);
+
+        // Verify run was recorded
+        let run_count = db
+            .exec(|conn| {
+                let c: i64 = conn.query_row("SELECT COUNT(*) FROM cron_runs", [], |r| r.get(0))?;
+                Ok(c)
+            })
+            .await
+            .unwrap();
+        assert_eq!(run_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_session_mode_falls_back() {
+        let db = Db::open_memory().unwrap();
+        let agent = test_agent_config();
+
+        // Create a job with unknown session mode
+        create_job(&db, "weird-mode", "* * * * *", "test", None, "unknown_mode")
+            .await
+            .unwrap();
+
+        // Backdate so it's due
+        let old_ts = (now_ms() - 25 * 60 * 60 * 1000) as i64;
+        db.exec(move |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET updated_at = ?1 WHERE name = 'weird-mode'",
+                rusqlite::params![old_ts],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Should run (falls back to isolated) without panic
+        let ran = check_and_run_due_jobs(&db, &agent, None).await.unwrap();
+        assert_eq!(ran, 1);
     }
 }

@@ -155,6 +155,60 @@ pub fn create_vec_table(conn: &rusqlite::Connection) -> Result<bool, rusqlite::E
     }
 }
 
+/// Check if the memory_vec virtual table exists.
+pub fn vec_table_exists(conn: &rusqlite::Connection) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_vec'",
+        [],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Insert (or replace) an embedding for a memory entry.
+pub fn vec_insert(
+    conn: &rusqlite::Connection,
+    memory_id: i64,
+    embedding: &[f32],
+) -> Result<(), rusqlite::Error> {
+    let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+    conn.execute(
+        "INSERT OR REPLACE INTO memory_vec (memory_id, embedding) VALUES (?1, ?2)",
+        rusqlite::params![memory_id, blob],
+    )?;
+    Ok(())
+}
+
+/// Delete an embedding for a memory entry.
+pub fn vec_delete(conn: &rusqlite::Connection, memory_id: i64) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM memory_vec WHERE memory_id = ?1",
+        rusqlite::params![memory_id],
+    )?;
+    Ok(())
+}
+
+/// KNN search: find the closest embeddings to the query. Returns (memory_id, distance).
+pub fn vec_search(
+    conn: &rusqlite::Connection,
+    query_embedding: &[f32],
+    limit: usize,
+) -> Result<Vec<(i64, f64)>, rusqlite::Error> {
+    let blob: Vec<u8> = query_embedding
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let mut stmt = conn.prepare(
+        "SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![blob, limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +216,12 @@ mod tests {
     #[test]
     fn test_target_dims() {
         assert_eq!(TARGET_DIMS, 384);
+    }
+
+    #[test]
+    fn test_vec_table_exists_false() {
+        // Without loading sqlite-vec, the table doesn't exist
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(!vec_table_exists(&conn));
     }
 }

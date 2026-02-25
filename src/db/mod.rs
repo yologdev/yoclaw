@@ -50,6 +50,14 @@ impl Db {
              PRAGMA foreign_keys = ON;
              PRAGMA busy_timeout = 5000;",
         )?;
+
+        // Load sqlite-vec extension and create vector table if available
+        #[cfg(feature = "semantic")]
+        {
+            vector::load_sqlite_vec(&conn).ok();
+            vector::create_vec_table(&conn).ok();
+        }
+
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
         };

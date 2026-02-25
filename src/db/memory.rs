@@ -1,5 +1,6 @@
 use super::{now_ms, Db, DbError};
 use rusqlite::Connection;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct MemoryEntry {
@@ -151,6 +152,22 @@ fn memory_store_sync(
                 "UPDATE memory SET content = ?1, tags = ?2, source = ?3, category = ?4, importance = ?5, updated_at = ?6 WHERE id = ?7",
                 rusqlite::params![content, tags, source, category, importance, ts as i64, id],
             )?;
+
+            // Update embedding on content change
+            #[cfg(feature = "semantic")]
+            {
+                if super::vector::vec_table_exists(conn) {
+                    if let Ok(engine) = super::vector::EmbeddingEngine::global() {
+                        match engine.embed(&[content]) {
+                            Ok(embeddings) if !embeddings.is_empty() => {
+                                super::vector::vec_insert(conn, id, &embeddings[0]).ok();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
             return Ok(id);
         }
     }
@@ -160,7 +177,29 @@ fn memory_store_sync(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
         rusqlite::params![key, content, tags, source, category, importance, ts as i64],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+
+    // Store embedding for vector search if semantic feature is enabled
+    #[cfg(feature = "semantic")]
+    {
+        if super::vector::vec_table_exists(conn) {
+            if let Ok(engine) = super::vector::EmbeddingEngine::global() {
+                match engine.embed(&[content]) {
+                    Ok(embeddings) if !embeddings.is_empty() => {
+                        if let Err(e) = super::vector::vec_insert(conn, id, &embeddings[0]) {
+                            tracing::warn!("Failed to store embedding for memory {}: {}", id, e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to compute embedding for memory {}: {}", id, e);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(id)
 }
 
 fn memory_search_sync(
@@ -168,18 +207,75 @@ fn memory_search_sync(
     query: &str,
     limit: usize,
 ) -> Result<Vec<MemoryEntry>, DbError> {
-    // Wrap in double quotes for safe literal matching
+    let fetch_limit = limit * 3; // over-fetch for re-ranking
+
+    // 1. FTS5 search (with LIKE fallback)
     let safe_query = format!("\"{}\"", query.replace('"', "\"\""));
-    let result = memory_search_fts(conn, &safe_query, limit * 3); // over-fetch for decay re-ranking
-    let mut entries = match result {
+    let fts_entries = match memory_search_fts(conn, &safe_query, fetch_limit) {
         Ok(entries) => entries,
-        Err(_) => {
-            // FTS5 query failed — fall back to LIKE search
-            memory_search_like(conn, query, limit * 3)?
+        Err(_) => memory_search_like(conn, query, fetch_limit)?,
+    };
+
+    // 2. Optionally run vector KNN search and merge with RRF
+    #[cfg(feature = "semantic")]
+    let mut entries = {
+        if super::vector::vec_table_exists(conn) {
+            if let Ok(engine) = super::vector::EmbeddingEngine::global() {
+                if let Ok(emb) = engine.embed(&[query]) {
+                    if let Ok(vec_results) = super::vector::vec_search(conn, &emb[0], fetch_limit) {
+                        // Build ranked lists: (id, rank)
+                        let fts_ranked: Vec<(i64, usize)> = fts_entries
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(rank, e)| e.id.map(|id| (id, rank)))
+                            .collect();
+                        let vec_ranked: Vec<(i64, usize)> = vec_results
+                            .iter()
+                            .enumerate()
+                            .map(|(rank, &(id, _))| (id, rank))
+                            .collect();
+
+                        // RRF merge
+                        let merged = rrf_merge(&fts_ranked, &vec_ranked, 60.0);
+
+                        // Build a lookup of existing FTS entries
+                        let mut entry_map: HashMap<i64, MemoryEntry> = fts_entries
+                            .into_iter()
+                            .filter_map(|e| e.id.map(|id| (id, e)))
+                            .collect();
+
+                        // Load any vector-only results not in FTS
+                        for &(id, _) in &merged {
+                            if !entry_map.contains_key(&id) {
+                                if let Ok(Some(entry)) = memory_get_by_id_sync(conn, id) {
+                                    entry_map.insert(id, entry);
+                                }
+                            }
+                        }
+
+                        // Reorder by RRF score
+                        merged
+                            .into_iter()
+                            .filter_map(|(id, _)| entry_map.remove(&id))
+                            .collect::<Vec<_>>()
+                    } else {
+                        fts_entries
+                    }
+                } else {
+                    fts_entries
+                }
+            } else {
+                fts_entries
+            }
+        } else {
+            fts_entries
         }
     };
 
-    // Apply temporal decay and re-rank
+    #[cfg(not(feature = "semantic"))]
+    let mut entries = fts_entries;
+
+    // 3. Apply temporal decay and re-rank
     let now = now_ms();
     entries.sort_by(|a, b| {
         let age_a = (now.saturating_sub(a.updated_at)) as f64 / (1000.0 * 60.0 * 60.0 * 24.0);
@@ -273,6 +369,55 @@ fn memory_search_fts(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+#[cfg(feature = "semantic")]
+fn memory_get_by_id_sync(conn: &Connection, id: i64) -> Result<Option<MemoryEntry>, DbError> {
+    let result = conn.query_row(
+        "SELECT id, key, content, tags, source, category, importance, last_accessed, access_count, created_at, updated_at
+         FROM memory WHERE id = ?1",
+        rusqlite::params![id],
+        |row| {
+            Ok(MemoryEntry {
+                id: Some(row.get(0)?),
+                key: row.get(1)?,
+                content: row.get(2)?,
+                tags: row.get(3)?,
+                source: row.get(4)?,
+                category: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "fact".to_string()),
+                importance: row.get::<_, Option<i32>>(6)?.unwrap_or(5),
+                last_accessed: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                access_count: row.get::<_, Option<i32>>(8)?.unwrap_or(0),
+                created_at: row.get::<_, i64>(9)? as u64,
+                updated_at: row.get::<_, i64>(10)? as u64,
+            })
+        },
+    );
+    match result {
+        Ok(entry) => Ok(Some(entry)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Reciprocal Rank Fusion: merge two ranked lists into a single score map.
+/// `k` is the RRF constant (typically 60). Each list entry is (id, rank) where rank is 0-based.
+/// Returns a map of id → RRF score, sorted descending by score.
+pub fn rrf_merge(
+    fts_ranked: &[(i64, usize)],
+    vec_ranked: &[(i64, usize)],
+    k: f64,
+) -> Vec<(i64, f64)> {
+    let mut scores: HashMap<i64, f64> = HashMap::new();
+    for &(id, rank) in fts_ranked {
+        *scores.entry(id).or_default() += 1.0 / (k + rank as f64);
+    }
+    for &(id, rank) in vec_ranked {
+        *scores.entry(id).or_default() += 1.0 / (k + rank as f64);
+    }
+    let mut result: Vec<(i64, f64)> = scores.into_iter().collect();
+    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    result
 }
 
 fn memory_get_sync(conn: &Connection, key: &str) -> Result<Option<MemoryEntry>, DbError> {
@@ -452,5 +597,29 @@ mod tests {
         // A preference 90 days old should decay to ~50%
         let score = apply_decay(1.0, 90.0, "preference");
         assert!((score - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_rrf_merge() {
+        // FTS returns docs [A=10, B=20, C=30] ranked 0,1,2
+        // Vec returns docs [B=20, D=40, A=10] ranked 0,1,2
+        let fts = vec![(10, 0), (20, 1), (30, 2)];
+        let vec = vec![(20, 0), (40, 1), (10, 2)];
+
+        let merged = rrf_merge(&fts, &vec, 60.0);
+
+        // B (id=20) appears in both lists at ranks 1 and 0 → highest RRF score
+        assert_eq!(merged[0].0, 20);
+
+        // A (id=10) appears in both lists at ranks 0 and 2
+        assert_eq!(merged[1].0, 10);
+
+        // C and D each appear in only one list
+        assert!(merged.len() == 4);
+
+        // Verify RRF scores are positive
+        for &(_, score) in &merged {
+            assert!(score > 0.0);
+        }
     }
 }

@@ -98,6 +98,10 @@ fn resolve_arc_provider(name: &str) -> Arc<dyn StreamProvider> {
         "anthropic" => Arc::new(AnthropicProvider),
         "openai" => Arc::new(OpenAiCompatProvider),
         "google" => Arc::new(GoogleProvider),
+        "vertex" => Arc::new(GoogleVertexProvider),
+        "azure" => Arc::new(AzureOpenAiProvider),
+        "bedrock" => Arc::new(BedrockProvider),
+        "openai_responses" => Arc::new(OpenAiResponsesProvider),
         other => {
             tracing::warn!(
                 "Unknown provider '{}' for worker, defaulting to anthropic",
