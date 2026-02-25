@@ -19,11 +19,17 @@ pub struct Conductor {
     db: Db,
     current_session: String,
     session_id_ref: Arc<std::sync::RwLock<String>>,
+    policy_ref: Arc<std::sync::RwLock<SecurityPolicy>>,
     budget: BudgetTracker,
     loaded_skills: Vec<LoadedSkill>,
     worker_infos: Vec<WorkerInfo>,
     /// Worker sub-agent tools for direct delegation (bypassing main agent).
     direct_workers: HashMap<String, Box<dyn AgentTool>>,
+    /// Max messages to restore for group chat catch-up.
+    max_group_catchup: usize,
+    /// Messages trimmed from the front during group chat catch-up.
+    /// Prepended back when saving to preserve the full tape.
+    group_catchup_prefix: Vec<AgentMessage>,
 }
 
 impl Conductor {
@@ -40,9 +46,10 @@ impl Conductor {
         // 2. Load skills with capability filtering
         let skills_dirs = config.skills_dirs();
         let skills_refs: Vec<&std::path::Path> = skills_dirs.iter().map(|p| p.as_path()).collect();
-        let policy = Arc::new(SecurityPolicy::from_config(&config.security));
+        let policy = SecurityPolicy::from_config(&config.security);
         let (skills_prompt, loaded_skills) =
             crate::skills::load_filtered_skills(&skills_refs, &policy);
+        let policy_ref = Arc::new(std::sync::RwLock::new(policy));
 
         if !loaded_skills.is_empty() {
             tracing::info!("Loaded {} skill(s)", loaded_skills.len());
@@ -62,12 +69,13 @@ impl Conductor {
         tool_list.push(Box::new(crate::scheduler::tools::CronScheduleTool::new(
             db.clone(),
         )));
+        tool_list.push(Box::new(tools::SendMessageTool));
 
         // 4. Wrap with security
         let session_id_ref = Arc::new(std::sync::RwLock::new(String::new()));
         let mut wrapped_tools = security::wrap_tools(
             tool_list,
-            policy.clone(),
+            policy_ref.clone(),
             db.clone(),
             session_id_ref.clone(),
         );
@@ -86,13 +94,13 @@ impl Conductor {
         let worker_tools: Vec<Arc<dyn AgentTool>> = vec![
             Arc::new(security::SecureToolWrapper {
                 inner: Box::new(tools::MemorySearchTool::new(db.clone())),
-                policy: policy.clone(),
+                policy: policy_ref.clone(),
                 db: db.clone(),
                 session_id: session_id_ref.clone(),
             }),
             Arc::new(security::SecureToolWrapper {
                 inner: Box::new(tools::MemoryStoreTool::new(db.clone())),
-                policy: policy.clone(),
+                policy: policy_ref.clone(),
                 db: db.clone(),
                 session_id: session_id_ref.clone(),
             }),
@@ -119,7 +127,7 @@ impl Conductor {
         for (sub_agent, _info) in workers {
             wrapped_tools.push(Box::new(security::SecureToolWrapper {
                 inner: Box::new(sub_agent),
-                policy: policy.clone(),
+                policy: policy_ref.clone(),
                 db: db.clone(),
                 session_id: session_id_ref.clone(),
             }));
@@ -162,6 +170,19 @@ impl Conductor {
             tracing::info!("Context management enabled");
         }
 
+        // 8b. Wire up injection detection if enabled
+        if config.security.injection.enabled {
+            let detector = crate::security::injection::InjectionDetector::new(
+                &config.security.injection.action,
+                &config.security.injection.extra_patterns,
+            );
+            agent = agent.with_input_filter(detector);
+            tracing::info!(
+                "Injection detection enabled (action: {})",
+                config.security.injection.action
+            );
+        }
+
         if let Some(max_tokens) = config.agent.max_tokens {
             agent = agent.with_max_tokens(max_tokens);
         }
@@ -182,10 +203,13 @@ impl Conductor {
             db,
             current_session: String::new(),
             session_id_ref,
+            policy_ref,
             budget,
             loaded_skills,
             worker_infos,
             direct_workers,
+            max_group_catchup: config.agent.context.max_group_catchup_messages,
+            group_catchup_prefix: Vec::new(),
         })
     }
 
@@ -199,31 +223,99 @@ impl Conductor {
         &self.worker_infos
     }
 
+    /// Update budget limits at runtime (hot-reload).
+    pub fn update_budget(&mut self, max_tokens: Option<u64>, max_turns: Option<usize>) {
+        self.budget.update_limits(max_tokens, max_turns);
+        tracing::info!(
+            "Budget updated: max_tokens={:?}, max_turns={:?}",
+            max_tokens,
+            max_turns
+        );
+    }
+
+    /// Replace the security policy at runtime (hot-reload).
+    /// This propagates to all SecureToolWrapper instances via the shared Arc<RwLock>.
+    pub fn update_security(&self, new_policy: SecurityPolicy) {
+        *self.policy_ref.write().unwrap() = new_policy;
+        tracing::info!("Security policy reloaded");
+    }
+
+    /// Update max group catchup messages (hot-reload).
+    pub fn update_max_group_catchup(&mut self, max: usize) {
+        self.max_group_catchup = max;
+    }
+
     /// Process a user message and return the assistant's text response.
+    /// If `on_progress` is provided, ProgressMessage events (from send_message tool)
+    /// are forwarded in real-time. `is_group` enables group chat catch-up slicing.
     pub async fn process_message(
         &mut self,
         session_id: &str,
         text: &str,
+        on_progress: Option<Box<dyn Fn(String) + Send + Sync>>,
+    ) -> Result<String, anyhow::Error> {
+        self.process_message_inner(session_id, text, false, on_progress)
+            .await
+    }
+
+    /// Process a message from a group chat. Only loads messages since the last
+    /// assistant reply (catch-up mode) instead of the full conversation history.
+    pub async fn process_group_message(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        on_progress: Option<Box<dyn Fn(String) + Send + Sync>>,
+    ) -> Result<String, anyhow::Error> {
+        self.process_message_inner(session_id, text, true, on_progress)
+            .await
+    }
+
+    async fn process_message_inner(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        is_group: bool,
+        on_progress: Option<Box<dyn Fn(String) + Send + Sync>>,
     ) -> Result<String, anyhow::Error> {
         // Switch session if needed
         if self.current_session != session_id {
-            self.switch_session(session_id).await?;
+            self.switch_session(session_id, is_group).await?;
         }
 
         // Run the agent
         let rx = self.agent.prompt(text).await;
 
         // Drain events and collect response
-        let response = drain_response(rx).await;
+        let result = drain_response(rx, on_progress).await;
 
-        // Persist conversation state
-        let messages = self.agent.messages();
-        self.db.tape_save_messages(session_id, messages).await?;
+        // Audit log if input was rejected (e.g. by injection detector)
+        if let Some(ref reason) = result.input_rejected {
+            let _ = self
+                .db
+                .audit_log(Some(session_id), "input_rejected", None, Some(reason), 0)
+                .await;
+        }
 
-        Ok(response)
+        // Persist conversation state — reconstruct full tape if group catchup trimmed a prefix
+        let prefix = std::mem::take(&mut self.group_catchup_prefix);
+        if prefix.is_empty() {
+            self.db
+                .tape_save_messages(session_id, self.agent.messages())
+                .await?;
+        } else {
+            let mut full_tape = prefix;
+            full_tape.extend_from_slice(self.agent.messages());
+            self.db.tape_save_messages(session_id, &full_tape).await?;
+        }
+
+        Ok(result.response)
     }
 
-    async fn switch_session(&mut self, new_session: &str) -> Result<(), anyhow::Error> {
+    async fn switch_session(
+        &mut self,
+        new_session: &str,
+        is_group: bool,
+    ) -> Result<(), anyhow::Error> {
         // Save current session if any
         if !self.current_session.is_empty() {
             let messages = self.agent.messages();
@@ -235,7 +327,26 @@ impl Conductor {
         }
 
         // Load new session
-        let messages = self.db.tape_load_messages(new_session).await?;
+        let mut messages = self.db.tape_load_messages(new_session).await?;
+
+        // Group chat catch-up: only load messages since the last assistant reply.
+        // Store the trimmed prefix so we can reconstruct the full tape when saving.
+        self.group_catchup_prefix = Vec::new();
+        if is_group && !messages.is_empty() {
+            let catchup = catchup_messages(messages.clone(), self.max_group_catchup);
+            let prefix_len = messages.len() - catchup.len();
+            if prefix_len > 0 {
+                self.group_catchup_prefix = messages[..prefix_len].to_vec();
+            }
+            messages = catchup;
+            tracing::info!(
+                "Group catch-up for {}: loading {} messages ({} preserved in prefix)",
+                new_session,
+                messages.len(),
+                prefix_len,
+            );
+        }
+
         if messages.is_empty() {
             self.agent.clear_messages();
         } else {
@@ -335,29 +446,74 @@ impl Conductor {
     }
 }
 
+/// For group chats, slice the message tape from the last assistant message onward,
+/// capped at `max_messages`. This gives the agent context of what happened since it
+/// last spoke, without loading the entire conversation history.
+fn catchup_messages(messages: Vec<AgentMessage>, max_messages: usize) -> Vec<AgentMessage> {
+    let last_assistant_idx = messages
+        .iter()
+        .rposition(|msg| matches!(msg, AgentMessage::Llm(Message::Assistant { .. })));
+    let sliced = match last_assistant_idx {
+        Some(idx) => messages[idx..].to_vec(),
+        None => messages, // bot has never replied — use all
+    };
+    // Cap to max_messages from the end
+    if sliced.len() > max_messages {
+        sliced[sliced.len() - max_messages..].to_vec()
+    } else {
+        sliced
+    }
+}
+
+/// Result of draining an agent event stream.
+struct DrainResult {
+    response: String,
+    /// If input was rejected by a filter (e.g. injection detection).
+    input_rejected: Option<String>,
+}
+
 /// Drain an AgentEvent receiver and return the final response text.
-async fn drain_response(mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> String {
+/// ProgressMessage events are forwarded via the optional callback.
+async fn drain_response(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    on_progress: Option<Box<dyn Fn(String) + Send + Sync>>,
+) -> DrainResult {
     let mut response = String::new();
+    let mut input_rejected = None;
     while let Some(event) = rx.recv().await {
-        if let AgentEvent::AgentEnd { ref messages } = event {
-            // Extract text from the last assistant message
-            for msg in messages.iter().rev() {
-                if let AgentMessage::Llm(Message::Assistant { ref content, .. }) = msg {
-                    for c in content {
-                        if let Content::Text { ref text } = c {
-                            if response.is_empty() {
-                                response = text.clone();
+        match event {
+            AgentEvent::ProgressMessage { text, .. } => {
+                if let Some(ref cb) = on_progress {
+                    cb(text);
+                }
+            }
+            AgentEvent::InputRejected { reason } => {
+                input_rejected = Some(reason);
+            }
+            AgentEvent::AgentEnd { ref messages } => {
+                // Extract text from the last assistant message
+                for msg in messages.iter().rev() {
+                    if let AgentMessage::Llm(Message::Assistant { ref content, .. }) = msg {
+                        for c in content {
+                            if let Content::Text { ref text } = c {
+                                if response.is_empty() {
+                                    response = text.clone();
+                                }
                             }
                         }
-                    }
-                    if !response.is_empty() {
-                        break;
+                        if !response.is_empty() {
+                            break;
+                        }
                     }
                 }
             }
+            _ => {}
         }
     }
-    response
+    DrainResult {
+        response,
+        input_rejected,
+    }
 }
 
 /// Resolve a provider name to a StreamProvider implementation.
@@ -405,15 +561,22 @@ api_key = "test-key"
             .with_tools(tools)
             .without_context_management();
 
+        let policy_ref = Arc::new(std::sync::RwLock::new(SecurityPolicy {
+            shell_deny_patterns: vec![],
+            tool_permissions: HashMap::new(),
+        }));
         let conductor = Conductor {
             agent,
             db: db.clone(),
             current_session: String::new(),
             session_id_ref,
+            policy_ref,
             budget,
             loaded_skills: Vec::new(),
             worker_infos: Vec::new(),
             direct_workers: HashMap::new(),
+            max_group_catchup: 50,
+            group_catchup_prefix: Vec::new(),
         };
 
         (conductor, db)
@@ -423,7 +586,7 @@ api_key = "test-key"
     async fn test_process_message() {
         let (mut conductor, _db) = test_conductor("Hello! How can I help?").await;
         let response = conductor
-            .process_message("test-session", "Hi there")
+            .process_message("test-session", "Hi there", None)
             .await
             .unwrap();
         assert_eq!(response, "Hello! How can I help?");
@@ -435,6 +598,10 @@ api_key = "test-key"
         let provider = MockProvider::texts(vec!["Response 1", "Response 2"]);
         let budget = BudgetTracker::new(None, None, db.clone());
         let session_id_ref = Arc::new(std::sync::RwLock::new(String::new()));
+        let policy_ref = Arc::new(std::sync::RwLock::new(SecurityPolicy {
+            shell_deny_patterns: vec![],
+            tool_permissions: HashMap::new(),
+        }));
 
         let agent = Agent::new(provider)
             .with_system_prompt("test")
@@ -447,17 +614,280 @@ api_key = "test-key"
             db: db.clone(),
             current_session: String::new(),
             session_id_ref,
+            policy_ref,
             budget,
             loaded_skills: Vec::new(),
             worker_infos: Vec::new(),
             direct_workers: HashMap::new(),
+            max_group_catchup: 50,
+            group_catchup_prefix: Vec::new(),
         };
 
         // Send a message
-        conductor.process_message("s1", "Hello").await.unwrap();
+        conductor
+            .process_message("s1", "Hello", None)
+            .await
+            .unwrap();
 
         // Verify it was saved to tape
         let messages = db.tape_load_messages("s1").await.unwrap();
         assert!(!messages.is_empty());
+    }
+
+    #[test]
+    fn test_catchup_messages_slices_from_last_assistant() {
+        let messages = vec![
+            AgentMessage::Llm(Message::user("old msg 1")),
+            AgentMessage::Llm(Message::Assistant {
+                content: vec![Content::Text {
+                    text: "old reply".to_string(),
+                }],
+                stop_reason: StopReason::Stop,
+                model: "m".to_string(),
+                provider: "p".to_string(),
+                usage: Usage::default(),
+                timestamp: 0,
+                error_message: None,
+            }),
+            AgentMessage::Llm(Message::user("new msg after reply")),
+            AgentMessage::Llm(Message::user("another new msg")),
+        ];
+
+        let sliced = catchup_messages(messages, 50);
+        // Should include the assistant message + the 2 user messages after it
+        assert_eq!(sliced.len(), 3);
+        // First should be assistant
+        assert!(matches!(
+            sliced[0],
+            AgentMessage::Llm(Message::Assistant { .. })
+        ));
+    }
+
+    #[test]
+    fn test_catchup_messages_no_assistant() {
+        let messages = vec![
+            AgentMessage::Llm(Message::user("msg1")),
+            AgentMessage::Llm(Message::user("msg2")),
+        ];
+        let sliced = catchup_messages(messages.clone(), 50);
+        // No assistant message — returns all messages
+        assert_eq!(sliced.len(), 2);
+    }
+
+    #[test]
+    fn test_catchup_messages_respects_max() {
+        let mut messages = Vec::new();
+        messages.push(AgentMessage::Llm(Message::Assistant {
+            content: vec![Content::Text {
+                text: "reply".to_string(),
+            }],
+            stop_reason: StopReason::Stop,
+            model: "m".to_string(),
+            provider: "p".to_string(),
+            usage: Usage::default(),
+            timestamp: 0,
+            error_message: None,
+        }));
+        // Add 100 user messages after the reply
+        for i in 0..100 {
+            messages.push(AgentMessage::Llm(Message::user(format!("msg {}", i))));
+        }
+
+        let sliced = catchup_messages(messages, 10);
+        assert_eq!(sliced.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_process_group_message_catch_up() {
+        let db = Db::open_memory().unwrap();
+
+        // Pre-populate tape with old conversation
+        let old_messages = vec![
+            AgentMessage::Llm(Message::user("old question")),
+            AgentMessage::Llm(Message::Assistant {
+                content: vec![Content::Text {
+                    text: "old answer".to_string(),
+                }],
+                stop_reason: StopReason::Stop,
+                model: "mock".to_string(),
+                provider: "mock".to_string(),
+                usage: Usage::default(),
+                timestamp: 0,
+                error_message: None,
+            }),
+            AgentMessage::Llm(Message::user("new group msg 1")),
+            AgentMessage::Llm(Message::user("new group msg 2")),
+        ];
+        db.tape_save_messages("group-session", &old_messages)
+            .await
+            .unwrap();
+
+        let provider = MockProvider::text("Group response");
+        let budget = BudgetTracker::new(None, None, db.clone());
+        let session_id_ref = Arc::new(std::sync::RwLock::new(String::new()));
+        let policy_ref = Arc::new(std::sync::RwLock::new(SecurityPolicy {
+            shell_deny_patterns: vec![],
+            tool_permissions: HashMap::new(),
+        }));
+
+        let agent = Agent::new(provider)
+            .with_system_prompt("test")
+            .with_model("mock")
+            .with_api_key("test")
+            .without_context_management();
+
+        let mut conductor = Conductor {
+            agent,
+            db: db.clone(),
+            current_session: String::new(),
+            session_id_ref,
+            policy_ref,
+            budget,
+            loaded_skills: Vec::new(),
+            worker_infos: Vec::new(),
+            direct_workers: HashMap::new(),
+            max_group_catchup: 50,
+            group_catchup_prefix: Vec::new(),
+        };
+
+        let response = conductor
+            .process_group_message("group-session", "new msg 3", None)
+            .await
+            .unwrap();
+        assert_eq!(response, "Group response");
+    }
+
+    #[tokio::test]
+    async fn test_drain_response_forwards_progress() {
+        use tokio::sync::mpsc;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let progress_msgs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let msgs_clone = progress_msgs.clone();
+
+        let on_progress: Box<dyn Fn(String) + Send + Sync> = Box::new(move |text: String| {
+            msgs_clone.lock().unwrap().push(text);
+        });
+
+        // Simulate events: a progress message followed by agent end
+        tx.send(AgentEvent::ProgressMessage {
+            tool_call_id: "tc-1".to_string(),
+            tool_name: "send_message".to_string(),
+            text: "Step 1 done".to_string(),
+        })
+        .unwrap();
+        tx.send(AgentEvent::AgentEnd {
+            messages: vec![AgentMessage::Llm(Message::Assistant {
+                content: vec![Content::Text {
+                    text: "Final response".to_string(),
+                }],
+                stop_reason: StopReason::Stop,
+                model: "mock".to_string(),
+                provider: "mock".to_string(),
+                usage: Usage::default(),
+                timestamp: 0,
+                error_message: None,
+            })],
+        })
+        .unwrap();
+        drop(tx);
+
+        let result = drain_response(rx, Some(on_progress)).await;
+        assert_eq!(result.response, "Final response");
+        assert!(result.input_rejected.is_none());
+        let captured = progress_msgs.lock().unwrap();
+        assert_eq!(&*captured, &["Step 1 done"]);
+    }
+
+    #[tokio::test]
+    async fn test_group_catchup_preserves_full_tape() {
+        let db = Db::open_memory().unwrap();
+
+        // Pre-populate tape with old conversation (4 messages)
+        let old_messages = vec![
+            AgentMessage::Llm(Message::user("ancient question")),
+            AgentMessage::Llm(Message::Assistant {
+                content: vec![Content::Text {
+                    text: "ancient answer".to_string(),
+                }],
+                stop_reason: StopReason::Stop,
+                model: "mock".to_string(),
+                provider: "mock".to_string(),
+                usage: Usage::default(),
+                timestamp: 0,
+                error_message: None,
+            }),
+            AgentMessage::Llm(Message::user("recent question")),
+            AgentMessage::Llm(Message::Assistant {
+                content: vec![Content::Text {
+                    text: "recent answer".to_string(),
+                }],
+                stop_reason: StopReason::Stop,
+                model: "mock".to_string(),
+                provider: "mock".to_string(),
+                usage: Usage::default(),
+                timestamp: 1,
+                error_message: None,
+            }),
+            AgentMessage::Llm(Message::user("new group msg")),
+        ];
+        db.tape_save_messages("group-full", &old_messages)
+            .await
+            .unwrap();
+
+        let provider = MockProvider::text("Group reply");
+        let budget = BudgetTracker::new(None, None, db.clone());
+        let session_id_ref = Arc::new(std::sync::RwLock::new(String::new()));
+        let policy_ref = Arc::new(std::sync::RwLock::new(SecurityPolicy {
+            shell_deny_patterns: vec![],
+            tool_permissions: HashMap::new(),
+        }));
+
+        let agent = Agent::new(provider)
+            .with_system_prompt("test")
+            .with_model("mock")
+            .with_api_key("test")
+            .without_context_management();
+
+        let mut conductor = Conductor {
+            agent,
+            db: db.clone(),
+            current_session: String::new(),
+            session_id_ref,
+            policy_ref,
+            budget,
+            loaded_skills: Vec::new(),
+            worker_infos: Vec::new(),
+            direct_workers: HashMap::new(),
+            max_group_catchup: 50,
+            group_catchup_prefix: Vec::new(),
+        };
+
+        // Process a group message — should use catchup slicing
+        conductor
+            .process_group_message("group-full", "another msg", None)
+            .await
+            .unwrap();
+
+        // Verify the full tape is preserved (not just the catchup slice)
+        let saved = db.tape_load_messages("group-full").await.unwrap();
+        // Should contain: ancient question, ancient answer, recent question, recent answer,
+        // new group msg (from pre-populated), another msg (new user input), Group reply (new response)
+        assert!(
+            saved.len() >= old_messages.len(),
+            "Full tape was truncated! Expected >= {} messages, got {}",
+            old_messages.len(),
+            saved.len()
+        );
+        // The first message should still be the ancient question
+        if let AgentMessage::Llm(Message::User { ref content, .. }) = saved[0] {
+            if let Some(Content::Text { ref text }) = content.first() {
+                assert_eq!(text, "ancient question");
+            } else {
+                panic!("Expected text content in first message");
+            }
+        } else {
+            panic!("Expected user message as first message");
+        }
     }
 }

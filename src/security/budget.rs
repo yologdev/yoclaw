@@ -89,6 +89,12 @@ impl BudgetTracker {
     pub fn turns_used(&self) -> u64 {
         self.turns_this_session.load(Ordering::Relaxed)
     }
+
+    /// Update budget limits at runtime (for hot-reload).
+    pub fn update_limits(&mut self, max_tokens: Option<u64>, max_turns: Option<usize>) {
+        self.max_tokens_per_day = max_tokens;
+        self.max_turns_per_session = max_turns;
+    }
 }
 
 #[cfg(test)]

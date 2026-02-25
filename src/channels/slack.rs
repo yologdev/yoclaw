@@ -180,6 +180,8 @@ fn handle_push_event(
             None => format!("slack-{}", channel_id),
         };
 
+        // Slack channels starting with "D" are DMs, others are group channels
+        let is_group = !channel_id.starts_with('D');
         let incoming = IncomingMessage {
             channel: "slack".into(),
             sender_id,
@@ -189,6 +191,7 @@ fn handle_push_event(
             reply_to: thread_ts,
             timestamp: now_ms(),
             worker_hint: None,
+            is_group,
         };
 
         let _ = tx.send(incoming);

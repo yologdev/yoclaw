@@ -18,6 +18,8 @@ pub struct IncomingMessage {
     pub timestamp: u64,
     /// If set, route this message directly to a named worker instead of the main conductor.
     pub worker_hint: Option<String>,
+    /// Whether this message originates from a group chat (vs a 1-on-1 DM).
+    pub is_group: bool,
 }
 
 /// An outgoing message to send back through a channel.
@@ -41,6 +43,12 @@ pub trait ChannelAdapter: Send + Sync {
 
     /// Channel name (e.g. "telegram", "discord").
     fn name(&self) -> &str;
+
+    /// Start a "typing" indicator for the given session. Returns a handle that,
+    /// when aborted, stops the indicator. Default: no-op.
+    fn start_typing(&self, _session_id: &str) -> Option<tokio::task::JoinHandle<()>> {
+        None
+    }
 }
 
 /// Split a message into chunks at newline boundaries, respecting max length.
@@ -108,5 +116,77 @@ mod tests {
         assert_eq!(chunks[0].len(), 40);
         assert_eq!(chunks[1].len(), 40);
         assert_eq!(chunks[2].len(), 20);
+    }
+
+    // -- Typing indicator tests --
+
+    struct NoopAdapter;
+
+    #[async_trait]
+    impl ChannelAdapter for NoopAdapter {
+        async fn start(
+            &self,
+            _tx: mpsc::UnboundedSender<IncomingMessage>,
+        ) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+        async fn send(&self, _msg: OutgoingMessage) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "noop"
+        }
+    }
+
+    #[test]
+    fn test_default_start_typing_returns_none() {
+        let adapter = NoopAdapter;
+        assert!(adapter.start_typing("test-session").is_none());
+    }
+
+    struct TypingAdapter;
+
+    #[async_trait]
+    impl ChannelAdapter for TypingAdapter {
+        async fn start(
+            &self,
+            _tx: mpsc::UnboundedSender<IncomingMessage>,
+        ) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+        async fn send(&self, _msg: OutgoingMessage) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "typing"
+        }
+        fn start_typing(&self, _session_id: &str) -> Option<tokio::task::JoinHandle<()>> {
+            Some(tokio::spawn(async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(100)).await;
+                }
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_typing_returns_handle() {
+        let adapter = TypingAdapter;
+        let handle = adapter.start_typing("s1");
+        assert!(handle.is_some());
+        let handle = handle.unwrap();
+        handle.abort();
+        // Should complete after abort
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_typing_handle_abort_stops_task() {
+        let adapter = TypingAdapter;
+        let handle = adapter.start_typing("s1").unwrap();
+        assert!(!handle.is_finished());
+        handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(handle.is_finished());
     }
 }

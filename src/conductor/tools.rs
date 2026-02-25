@@ -184,6 +184,62 @@ impl AgentTool for MemoryStoreTool {
     }
 }
 
+/// Tool that lets the agent send a message to the user mid-task via progress events.
+/// The message is delivered immediately through the channel adapter, NOT stored in tape.
+pub struct SendMessageTool;
+
+#[async_trait::async_trait]
+impl AgentTool for SendMessageTool {
+    fn name(&self) -> &str {
+        "send_message"
+    }
+
+    fn label(&self) -> &str {
+        "Send Message"
+    }
+
+    fn description(&self) -> &str {
+        "Send a message to the user immediately without waiting for the full response. \
+         Use this to provide progress updates, ask follow-up questions during long tasks, \
+         or deliver partial results. The message is delivered in real-time."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The message to send to the user immediately"
+                }
+            },
+            "required": ["message"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let message = params["message"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidArgs("Missing 'message' parameter".into()))?;
+
+        // Emit via progress callback — this will be routed to the channel adapter
+        if let Some(ref on_progress) = ctx.on_progress {
+            on_progress(message.to_string());
+        }
+
+        Ok(ToolResult {
+            content: vec![Content::Text {
+                text: "Message sent.".to_string(),
+            }],
+            details: serde_json::json!({}),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +277,51 @@ mod tests {
             .await
             .unwrap();
         assert!(content_text(&result.content[0]).contains("dark mode"));
+    }
+
+    #[tokio::test]
+    async fn test_send_message_tool_with_progress() {
+        let tool = SendMessageTool;
+        let progress_msgs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let msgs_clone = progress_msgs.clone();
+
+        let ctx = ToolContext {
+            tool_call_id: "tc-1".to_string(),
+            tool_name: "send_message".to_string(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            on_update: None,
+            on_progress: Some(std::sync::Arc::new(move |text: String| {
+                msgs_clone.lock().unwrap().push(text);
+            })),
+        };
+
+        let result = tool
+            .execute(serde_json::json!({"message": "Processing step 1..."}), ctx)
+            .await
+            .unwrap();
+
+        assert!(content_text(&result.content[0]).contains("Message sent"));
+        let captured = progress_msgs.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0], "Processing step 1...");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_tool_without_progress() {
+        let tool = SendMessageTool;
+        // No on_progress callback — should still succeed without error
+        let result = tool
+            .execute(serde_json::json!({"message": "Hello"}), test_ctx())
+            .await
+            .unwrap();
+        assert!(content_text(&result.content[0]).contains("Message sent"));
+    }
+
+    #[tokio::test]
+    async fn test_send_message_tool_missing_param() {
+        let tool = SendMessageTool;
+        let result = tool.execute(serde_json::json!({}), test_ctx()).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

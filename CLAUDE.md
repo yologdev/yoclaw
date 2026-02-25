@@ -20,7 +20,7 @@ RUST_LOG=yoclaw=debug cargo run
 
 ## Architecture
 
-yoclaw is a single-binary AI agent orchestrator built on **yoagent** (path dep: `../yoagent-repo`). It connects LLMs to messaging platforms with SQLite persistence.
+yoclaw is a single-binary AI agent orchestrator built on **yoagent v0.5.0** (path dep: `../yoagent-repo`). It connects LLMs to messaging platforms with SQLite persistence.
 
 ### Core flow
 
@@ -48,9 +48,10 @@ Channel (Telegram/Discord/Slack) → MessageCoalescer (debounce) → Queue (SQLi
 
 - `AgentEvent` is NOT `Serialize` — tape stores `Vec<AgentMessage>` snapshots (which IS Serialize)
 - `on_before_turn` / `on_after_turn` callbacks are **sync** — hence `AtomicU64` for budget tracking
+- `AgentTool::execute()` uses v0.5.0 signature: `execute(params, ctx: ToolContext)` where `ToolContext` bundles `tool_call_id`, `tool_name`, `cancel`, `on_update`, `on_progress`
 - Workers use `SubAgentTool` (ephemeral: fresh `agent_loop` per invocation)
 - Direct worker delegation: `delegate_to_worker` calls `SubAgentTool::execute` directly, persists exchange to tape, invalidates session
-- Ephemeral agents: `run_ephemeral_prompt()` in `scheduler/mod.rs` uses `agent_loop` directly for cron/cortex tasks
+- Ephemeral agents: `run_ephemeral_prompt()` in `scheduler/mod.rs` uses `agent_loop` directly for cron/cortex tasks; `AgentLoopConfig` requires `input_filters` field
 - Default tools from `yoagent::tools::default_tools()` are wrapped with `SecureToolWrapper`
 - Direct workers are NOT wrapped in `SecureToolWrapper` — their inner tools are already secured; wrapping the SubAgentTool itself would audit under the worker name, not a real tool name
 

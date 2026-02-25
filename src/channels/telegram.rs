@@ -41,6 +41,7 @@ impl ChannelAdapter for TelegramAdapter {
                             return respond(());
                         }
 
+                        let is_group = msg.chat.is_group() || msg.chat.is_supergroup();
                         let incoming = IncomingMessage {
                             channel: "telegram".into(),
                             sender_id: sender_id.to_string(),
@@ -50,6 +51,7 @@ impl ChannelAdapter for TelegramAdapter {
                             reply_to: msg.reply_to_message().map(|m| m.id.0.to_string()),
                             timestamp: now_ms(),
                             worker_hint: None,
+                            is_group,
                         };
 
                         let _ = tx.send(incoming);
@@ -82,5 +84,21 @@ impl ChannelAdapter for TelegramAdapter {
 
     fn name(&self) -> &str {
         "telegram"
+    }
+
+    fn start_typing(&self, session_id: &str) -> Option<tokio::task::JoinHandle<()>> {
+        let chat_id: i64 = session_id
+            .strip_prefix("tg-")
+            .and_then(|s| s.parse().ok())?;
+        let bot = self.bot.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                let _ = bot
+                    .send_chat_action(ChatId(chat_id), teloxide::types::ChatAction::Typing)
+                    .await;
+                // Telegram typing indicator lasts ~5s, refresh every 4s
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            }
+        }))
     }
 }
