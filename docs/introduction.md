@@ -57,18 +57,21 @@ Optional semantic search (via the `semantic` feature flag) adds vector embedding
 
 The **cortex** — an automated maintenance scheduler — periodically deduplicates memories, cleans up stale entries, consolidates related memories, and indexes conversations into long-term storage.
 
-## How it compares
+## Feature summary
 
-| Feature | yoclaw | OpenClaw | LangChain | Custom bot |
-|---------|--------|----------|-----------|------------|
-| Language | Rust | Python | Python | varies |
-| Deployment | Single binary | Docker + Redis | pip install | custom |
-| Memory | SQLite FTS5 + vector | Redis | various | none |
-| Security | Built-in policy engine | limited | none | none |
-| Crash recovery | Automatic | manual | none | none |
-| Multi-channel | Telegram, Discord, Slack | Slack | none | one |
-| Worker delegation | Built-in sub-agents | none | chains | none |
-| Cron scheduling | Built-in | none | none | crontab |
+| Feature | What yoclaw provides |
+|---------|---------------------|
+| Deployment | Single binary, no external services |
+| Persistence | SQLite with WAL mode — conversations, queue, memory, audit |
+| Memory | FTS5 full-text search + optional vector embeddings |
+| Security | Policy engine: tool permissions, shell deny patterns, path/host allowlists, injection detection |
+| Crash recovery | Automatic queue reprocessing on restart |
+| Channels | Telegram, Discord, Slack (simultaneously) |
+| Workers | Sub-agent delegation with per-worker models and prompts |
+| Scheduling | Built-in cron jobs with ephemeral or persistent sessions |
+| Providers | Anthropic, OpenAI, Google, Vertex AI, Azure, Bedrock, OpenAI Responses |
+| Budget | Daily token limits and per-session turn limits |
+| Web UI | Embedded dashboard with REST API and SSE |
 
 ## What's in this book
 

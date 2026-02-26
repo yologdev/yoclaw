@@ -80,22 +80,19 @@ The **cortex** is an automated memory maintenance system that runs periodically 
 
 ### 1. Stale cleanup
 
-Removes old memories that have decayed below relevance:
-- Tasks older than 14 days
-- Contexts older than 28 days
-- Events older than 28 days
+Removes memory entries that haven't been accessed in **90+ days** and have **importance <= 3**. Decisions (category `"decision"`) are never cleaned up regardless of age or importance.
 
 ### 2. Deduplication
 
-Finds memories with similar content and merges them, keeping the highest-importance version.
+Finds memories with identical content and removes duplicates, keeping the most recently created entry.
 
 ### 3. Consolidation
 
-Uses an LLM to analyze groups of related memories and produce consolidated summaries. For example, five separate memories about a project might be consolidated into one comprehensive summary.
+Scans sessions updated in the last 24 hours (with at least 4 messages) and uses an LLM to extract 1-3 durable facts from each conversation. Extracted facts are stored as memories with category `"fact"` and importance 6. Each session is only consolidated once.
 
 ### 4. Session indexing
 
-Scans recent conversations and extracts key facts, decisions, and preferences into long-term memory. This happens automatically — the agent doesn't need to explicitly store everything.
+Summarizes recent sessions (updated in the last 24 hours, at least 2 messages) into 1-2 sentence summaries stored as `"reflection"` category memories. This makes past conversations searchable by topic. Each session is only indexed once.
 
 ### Cortex configuration
 

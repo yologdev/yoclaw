@@ -40,9 +40,10 @@ The web server exposes a JSON API:
 | Endpoint | Method | Description |
 |----------|--------|------------|
 | `/api/sessions` | GET | List all sessions with message counts |
-| `/api/queue` | GET | Current queue state |
+| `/api/sessions/{id}/messages` | GET | Get conversation messages for a session |
+| `/api/queue` | GET | Current queue state (pending count) |
 | `/api/budget` | GET | Token usage and limits |
-| `/api/audit` | GET | Recent audit log entries |
+| `/api/audit` | GET | Recent audit log entries (supports `?session=` and `?limit=` query params) |
 
 ### Example: check budget
 
@@ -52,8 +53,8 @@ curl http://localhost:19898/api/budget
 
 ```json
 {
-  "tokens_today": 45230,
-  "max_tokens_per_day": 1000000,
+  "tokens_used_today": 45230,
+  "daily_limit": 1000000,
   "remaining": 954770
 }
 ```
