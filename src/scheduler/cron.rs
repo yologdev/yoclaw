@@ -98,11 +98,13 @@ pub async fn check_and_run_due_jobs(
                 .await?;
 
                 // Deliver to target channel if configured
-                if let (Some(channel), Some(tx)) = (&job.target_channel, delivery_tx) {
-                    let session_id = format!("cron-{}", job.name);
+                if let (Some(target), Some(tx)) = (&job.target_channel, delivery_tx) {
+                    // target is a session_id like "tg-514133400" or "dc-guild-channel"
+                    // Derive the adapter name from the prefix
+                    let adapter_name = channel_from_session_id(target);
                     let _ = tx.send(OutgoingMessage {
-                        channel: channel.clone(),
-                        session_id,
+                        channel: adapter_name.to_string(),
+                        session_id: target.clone(),
                         content: response,
                         reply_to: None,
                     });
@@ -141,6 +143,21 @@ pub async fn check_and_run_due_jobs(
     }
 
     Ok(ran)
+}
+
+/// Derive the adapter/channel name from a session_id prefix.
+/// e.g. "tg-514133400" → "telegram", "dc-guild-chan" → "discord", "slack-chan" → "slack"
+fn channel_from_session_id(session_id: &str) -> &str {
+    if session_id.starts_with("tg-") {
+        "telegram"
+    } else if session_id.starts_with("dc-") {
+        "discord"
+    } else if session_id.starts_with("slack-") {
+        "slack"
+    } else {
+        // Fallback: use the session_id as-is (legacy behavior)
+        session_id
+    }
 }
 
 /// A loaded cron job from the database.
@@ -531,5 +548,13 @@ mod tests {
         // Should run (falls back to isolated) without panic
         let ran = check_and_run_due_jobs(&db, &agent, None).await.unwrap();
         assert_eq!(ran, 1);
+    }
+
+    #[test]
+    fn test_channel_from_session_id() {
+        assert_eq!(channel_from_session_id("tg-514133400"), "telegram");
+        assert_eq!(channel_from_session_id("dc-guild-channel"), "discord");
+        assert_eq!(channel_from_session_id("slack-general"), "slack");
+        assert_eq!(channel_from_session_id("unknown-id"), "unknown-id");
     }
 }

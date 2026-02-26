@@ -64,16 +64,17 @@ impl Conductor {
         };
 
         // 3. Build tools
+        let session_id_ref = Arc::new(std::sync::RwLock::new(String::new()));
         let mut tool_list: Vec<Box<dyn AgentTool>> = yoagent::tools::default_tools();
         tool_list.push(Box::new(tools::MemorySearchTool::new(db.clone())));
         tool_list.push(Box::new(tools::MemoryStoreTool::new(db.clone())));
         tool_list.push(Box::new(crate::scheduler::tools::CronScheduleTool::new(
             db.clone(),
+            session_id_ref.clone(),
         )));
         tool_list.push(Box::new(tools::SendMessageTool));
 
         // 4. Wrap with security
-        let session_id_ref = Arc::new(std::sync::RwLock::new(String::new()));
         let mut wrapped_tools = security::wrap_tools(
             tool_list,
             policy_ref.clone(),

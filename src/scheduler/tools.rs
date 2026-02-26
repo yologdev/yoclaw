@@ -1,16 +1,18 @@
 //! AgentTool for managing cron jobs conversationally.
 
 use crate::db::Db;
+use std::sync::{Arc, RwLock};
 use yoagent::types::*;
 
 /// Tool for the agent to create, list, and delete cron jobs.
 pub struct CronScheduleTool {
     db: Db,
+    session_id_ref: Arc<RwLock<String>>,
 }
 
 impl CronScheduleTool {
-    pub fn new(db: Db) -> Self {
-        Self { db }
+    pub fn new(db: Db, session_id_ref: Arc<RwLock<String>>) -> Self {
+        Self { db, session_id_ref }
     }
 }
 
@@ -53,7 +55,7 @@ impl AgentTool for CronScheduleTool {
                 },
                 "target": {
                     "type": "string",
-                    "description": "Target channel to deliver results (e.g. 'telegram', 'discord')"
+                    "description": "Target session ID to deliver results to (e.g. 'tg-514133400' for Telegram, 'dc-guild-channel' for Discord)"
                 },
                 "session": {
                     "type": "string",
@@ -109,7 +111,21 @@ impl CronScheduleTool {
         let prompt = params["prompt"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidArgs("Missing 'prompt' for create".into()))?;
-        let target = params["target"].as_str();
+        // Auto-fill target with current session_id if not provided
+        let explicit_target = params["target"].as_str().map(|s| s.to_string());
+        let auto_target;
+        let target = match &explicit_target {
+            Some(t) => Some(t.as_str()),
+            None => {
+                let sid = self.session_id_ref.read().unwrap().clone();
+                if !sid.is_empty() {
+                    auto_target = sid;
+                    Some(auto_target.as_str())
+                } else {
+                    None
+                }
+            }
+        };
         let session = params["session"].as_str().unwrap_or("isolated");
 
         super::cron::create_job(&self.db, name, schedule, prompt, target, session)
@@ -216,7 +232,7 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_create_and_list() {
         let db = Db::open_memory().unwrap();
-        let tool = CronScheduleTool::new(db);
+        let tool = CronScheduleTool::new(db, Arc::new(RwLock::new(String::new())));
 
         // Create a job
         let result = tool
@@ -248,7 +264,7 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_delete() {
         let db = Db::open_memory().unwrap();
-        let tool = CronScheduleTool::new(db);
+        let tool = CronScheduleTool::new(db, Arc::new(RwLock::new(String::new())));
 
         // Create then delete
         tool.execute(
@@ -286,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_toggle() {
         let db = Db::open_memory().unwrap();
-        let tool = CronScheduleTool::new(db);
+        let tool = CronScheduleTool::new(db, Arc::new(RwLock::new(String::new())));
 
         tool.execute(
             serde_json::json!({
