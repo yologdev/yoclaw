@@ -3,6 +3,8 @@
 </p>
 
 <p align="center">
+  <a href="https://crates.io/crates/yoclaw">crates.io</a> ·
+  <a href="https://docs.rs/yoclaw">Docs</a> ·
   <a href="https://github.com/yologdev/yoclaw">GitHub</a> ·
   <a href="https://deepwiki.com/yologdev/yoclaw">DeepWiki</a> ·
   <a href="https://github.com/yologdev/yoclaw/issues">Issues</a> ·
@@ -10,8 +12,10 @@
 </p>
 
 <p align="center">
+  <a href="https://crates.io/crates/yoclaw"><img src="https://img.shields.io/crates/v/yoclaw?logo=rust&logoColor=white&label=crates.io" alt="crates.io"></a>
   <a href="https://github.com/yologdev/yoclaw/actions"><img src="https://img.shields.io/github/actions/workflow/status/yologdev/yoclaw/ci.yml?label=CI&logo=github" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="license MIT"></a>
+  <a href="https://docs.rs/yoclaw"><img src="https://img.shields.io/docsrs/yoclaw?label=docs&logo=rust&logoColor=white" alt="docs"></a>
   <a href="https://github.com/yologdev/yoclaw/commits/master"><img src="https://img.shields.io/github/last-commit/yologdev/yoclaw" alt="last commit"></a>
 </p>
 
@@ -133,7 +137,7 @@ src/
 ## Requirements
 
 - Rust 1.75+
-- [yoagent](https://github.com/yologdev/yoagent) (path dependency at `../yoagent-repo`)
+- [yoagent](https://crates.io/crates/yoagent) v0.5.1+
 
 ## License
 
