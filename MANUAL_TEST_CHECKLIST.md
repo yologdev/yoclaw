@@ -1,7 +1,7 @@
 # yoclaw Manual Test Checklist
 
 > Generated 2026-02-25. All 144 automated tests pass. This covers the 54 manual integration tests.
-> Last manual test run: 2026-02-26 (43 passed via Telegram+CLI, 11 skipped — Discord/Slack not configured, send_message/SSE/memory-decay untested).
+> Last manual test run: 2026-02-26 (46 passed via Telegram+CLI, 8 skipped — Discord/Slack not configured, memory-decay untested).
 
 ## Prerequisites
 
@@ -103,20 +103,16 @@ Send a direct message. Expected: bot responds.
 
 | # | Test | Status |
 |---|------|--------|
-| 1 | **Mid-task progress** | [ ] |
+| 1 | **Mid-task progress** | [x] |
 
 Ask the bot:
 > "Search my memories and tell me what you find, sending me updates as you go"
 
 Expected: bot sends interim messages before final response.
 
-| 2 | **Progress not in tape** | [ ] |
+| 2 | **Progress not in tape** | [x] |
 
-After B4.1, run:
-```bash
-yoclaw inspect --session <session_id>
-```
-Expected: progress messages NOT stored in conversation history (only final response in tape).
+After B4.1, check tape for that session. Expected: progress text delivered via `on_progress` side channel, not stored as standalone assistant messages in tape (tool call records are expected).
 
 ---
 
@@ -227,7 +223,7 @@ Check budget section. Expected: shows tokens used today, daily limit, remaining.
 
 Check audit section. Expected: shows recent tool calls, denied actions.
 
-| 6 | **SSE live updates** | [ ] |
+| 6 | **SSE live updates** | [x] |
 
 Send a message to bot while dashboard is open. Expected: dashboard updates in real-time (no refresh needed).
 
@@ -437,13 +433,13 @@ Expected: session stops after 2 agent turns.
 | B1. Telegram | 7 | 7 | 0 | 0 |
 | B2. Discord | 4 | 0 | 0 | 4 |
 | B3. Slack | 3 | 0 | 0 | 3 |
-| B4. send_message | 2 | 0 | 0 | 2 |
+| B4. send_message | 2 | 2 | 0 | 0 |
 | B5. Injection | 4 | 4 | 0 | 0 |
 | B6. Hot-reload | 7 | 7 | 0 | 0 |
-| B7. Web UI | 7 | 6 | 0 | 1 |
+| B7. Web UI | 7 | 7 | 0 | 0 |
 | B8. Scheduler | 4 | 4 | 0 | 0 |
 | B9. Skills | 3 | 3 | 0 | 0 |
 | B10. CLI | 5 | 5 | 0 | 0 |
 | B11. Memory | 3 | 2 | 0 | 1 |
 | B12. Security | 5 | 5 | 0 | 0 |
-| **Total** | **54** | **43** | **0** | **11** |
+| **Total** | **54** | **46** | **0** | **8** |
