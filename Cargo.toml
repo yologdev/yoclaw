@@ -1,9 +1,11 @@
 [package]
 name = "yoclaw"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 rust-version = "1.75"
 description = "Secure, single-binary AI agent orchestrator"
+license = "MIT"
+repository = "https://github.com/yologdev/yoclaw"
 
 [features]
 default = []
