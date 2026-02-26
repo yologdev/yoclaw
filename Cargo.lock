@@ -5411,6 +5411,7 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 [[package]]
 name = "yoagent"
 version = "0.5.1"
+source = "git+https://github.com/yologdev/yoagent.git?tag=v0.5.1#ac7683ca848fd151d31b912de8764612f2afa9a7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
