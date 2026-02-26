@@ -1,7 +1,7 @@
 # yoclaw Manual Test Checklist
 
 > Generated 2026-02-25. All 144 automated tests pass. This covers the 54 manual integration tests.
-> Last manual test run: 2026-02-26 (35 passed via Telegram+CLI, 19 skipped — Discord/Slack not configured, cron/send_message untested).
+> Last manual test run: 2026-02-26 (40 passed via Telegram+CLI, 14 skipped — Discord/Slack not configured, cron/send_message/SSE/memory-decay untested).
 
 ## Prerequisites
 
@@ -313,7 +313,7 @@ enabled = false
 ```
 Then check `yoclaw inspect --skills`. Expected: skill excluded from loaded list.
 
-| 3 | **Skill in prompt** | [ ] |
+| 3 | **Skill in prompt** | [x] |
 
 With test-skill loaded, ask the bot about testing. Expected: agent uses skill instructions in response.
 
@@ -396,7 +396,7 @@ Store several distinct memories, then search by keyword. Expected: returns ranke
 
 If shell is enabled, prompt the bot to run a dangerous command (e.g. `rm -rf /`). Expected: blocked by SecurityPolicy, audit logged.
 
-| 2 | **Tool disabled** | [ ] |
+| 2 | **Tool disabled** | [x] |
 
 Disable `shell` in config:
 ```toml
@@ -405,11 +405,11 @@ enabled = false
 ```
 Expected: all shell tool calls rejected.
 
-| 3 | **Path allowlist** | [ ] |
+| 3 | **Path allowlist** | [x] |
 
 Set `allowed_paths` in config, then prompt bot to access a path outside the allowlist. Expected: blocked.
 
-| 4 | **Budget exceeded** | [ ] |
+| 4 | **Budget exceeded** | [x] |
 
 Set a very low daily token limit:
 ```toml
@@ -418,7 +418,7 @@ max_tokens_per_day = 100
 ```
 Expected: bot stops processing after limit, returns budget error.
 
-| 5 | **Turn limit** | [ ] |
+| 5 | **Turn limit** | [x] |
 
 Set:
 ```toml
@@ -441,8 +441,8 @@ Expected: session stops after 2 agent turns.
 | B6. Hot-reload | 7 | 7 | 0 | 0 |
 | B7. Web UI | 7 | 6 | 0 | 1 |
 | B8. Scheduler | 4 | 1 | 0 | 3 |
-| B9. Skills | 3 | 2 | 0 | 1 |
+| B9. Skills | 3 | 3 | 0 | 0 |
 | B10. CLI | 5 | 5 | 0 | 0 |
 | B11. Memory | 3 | 2 | 0 | 1 |
-| B12. Security | 5 | 1 | 0 | 4 |
-| **Total** | **54** | **35** | **0** | **19** |
+| B12. Security | 5 | 5 | 0 | 0 |
+| **Total** | **54** | **40** | **0** | **14** |
