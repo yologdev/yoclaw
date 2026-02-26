@@ -1,0 +1,22 @@
+[book]
+authors = ["Yolog Team"]
+language = "en"
+src = "docs"
+title = "yoclaw Documentation"
+description = "Documentation for yoclaw - secure, single-binary AI agent orchestrator"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/yologdev/yoclaw"
+edit-url-template = "https://github.com/yologdev/yoclaw/edit/master/{path}"
+site-url = "/yoclaw/"
+additional-css = ["docs/theme/custom.css"]
+
+[output.html.search]
+enable = true
+limit-results = 20
