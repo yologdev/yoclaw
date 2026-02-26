@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build                    # Build
-cargo test                     # All 105 tests
+cargo test                     # All 145 tests
 cargo test config              # Tests in a specific module
 cargo test test_parse_minimal  # Single test by name
 cargo clippy -- -D warnings    # Lint (CI-style)
@@ -64,6 +64,18 @@ pub async fn exec<F, T>(&self, f: F) -> Result<T, DbError>  // spawn_blocking
 pub fn exec_sync<F, T>(&self, f: F) -> Result<T, DbError>   // direct, for tests
 ```
 
+**Important:** `exec_sync` is designed for tests and sync callbacks. When calling from an async context (e.g. `on_after_turn`), wrap in `tokio::task::block_in_place()` to avoid blocking the tokio worker thread.
+
+### Cron delivery
+
+Cron jobs use `target_channel` (a session_id like `"tg-514133400"`) to route delivery. `channel_from_session_id()` in `scheduler/cron.rs` maps session_id prefixes to adapter names (`"tg-"` → `"telegram"`, `"dc-"` → `"discord"`, `"slack-"` → `"slack"`). `OutgoingMessage.channel` must match `adapter.name()`, while `session_id` carries the actual routing info (e.g. chat_id).
+
+### Config hot-reload
+
+The watcher reloads config on file changes, but not all settings are hot-reloadable:
+- **Hot-reloadable:** budget limits, security policy (deny patterns, tool permissions), debounce timings
+- **Requires restart:** agent provider/model/api_key, injection detection config, Discord allowlist/routing, workers, skills
+
 ### Config location
 
 `~/.yoclaw/config.toml` — persona at `~/.yoclaw/persona.md`, skills in `~/.yoclaw/skills/`, DB at `~/.yoclaw/yoclaw.db`.
@@ -80,6 +92,10 @@ pub fn exec_sync<F, T>(&self, f: F) -> Result<T, DbError>   // direct, for tests
 - Error types via `thiserror` per module (`DbError`, `ConfigError`, `SecurityDenied`, `SkillError`)
 - `anyhow` at the binary boundary (main.rs)
 - Security tool name mapping: yoagent's `bash` → config's `shell`, `edit_file` → `write_file`
-- Session IDs: `tg-{chat_id}` for Telegram, `dc-{guild}-{channel}` for Discord, `slack-{channel}` / `slack-{channel}-{thread_ts}` for Slack, `cron-{job_name}` for scheduled jobs
+- Session IDs: `tg-{chat_id}` for Telegram, `dc-{channel_id}` for Discord, `slack-{channel}` / `slack-{channel}-{thread_ts}` for Slack, `cron-{job_name}` for scheduled jobs
 - SQL migrations via `include_str!` in `db/mod.rs`, tracked by `schema_version` table
 - String splitting/truncation must use `is_char_boundary()` to avoid panicking on multi-byte UTF-8 (see `split_message` in `channels/mod.rs`)
+- Cron config uses `[[scheduler.cron.jobs]]` (TOML array-of-tables), NOT `[scheduler.cron.job_name]`
+- `allowed_paths` in security config only applies to file tools (`read_file`, `write_file`, `edit_file`, `list_files`, `search`), not `bash`/`shell`
+- Empty responses must be avoided — Telegram and Discord reject empty message bodies. Early-return paths (injection block, budget exceeded) must return a canned message.
+- Discord adapter requires **Message Content Intent** enabled in the Discord Developer Portal
