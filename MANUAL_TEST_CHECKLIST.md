@@ -1,7 +1,7 @@
 # yoclaw Manual Test Checklist
 
 > Generated 2026-02-25. All 144 automated tests pass. This covers the 54 manual integration tests.
-> Last manual test run: 2026-02-26 (50 passed via Telegram+CLI+Discord, 4 skipped — Slack not configured, memory-decay untested).
+> Last manual test run: 2026-02-26 (52 passed via Telegram+CLI+Discord+Slack, 2 skipped — Slack DM workspace restriction, memory-decay untested).
 
 ## Prerequisites
 
@@ -85,17 +85,17 @@ Trigger >2000 char response. Expected: split correctly at Discord's limit.
 
 | # | Test | Status |
 |---|------|--------|
-| 1 | **Channel message** | [ ] |
+| 1 | **Channel message** | [x] |
 
 Send in an allowed channel. Expected: bot responds.
 
-| 2 | **Thread reply** | [ ] |
+| 2 | **Thread reply** | [x] |
 
 Reply in a thread. Expected: bot responds in same thread (session_id includes thread_ts).
 
-| 3 | **DM** | [ ] |
+| 3 | **DM** | [skip] |
 
-Send a direct message. Expected: bot responds.
+Send a direct message. Expected: bot responds. *Skipped: Slack workspace restriction — "Sending messages to this app has been turned off." Requires Messages Tab + DM scopes; may be blocked by workspace admin policy.*
 
 ---
 
@@ -432,7 +432,7 @@ Expected: session stops after 2 agent turns.
 |----------|-------|--------|--------|---------|
 | B1. Telegram | 7 | 7 | 0 | 0 |
 | B2. Discord | 4 | 4 | 0 | 0 |
-| B3. Slack | 3 | 0 | 0 | 3 |
+| B3. Slack | 3 | 2 | 0 | 1 |
 | B4. send_message | 2 | 2 | 0 | 0 |
 | B5. Injection | 4 | 4 | 0 | 0 |
 | B6. Hot-reload | 7 | 7 | 0 | 0 |
@@ -442,4 +442,4 @@ Expected: session stops after 2 agent turns.
 | B10. CLI | 5 | 5 | 0 | 0 |
 | B11. Memory | 3 | 2 | 0 | 1 |
 | B12. Security | 5 | 5 | 0 | 0 |
-| **Total** | **54** | **50** | **0** | **4** |
+| **Total** | **54** | **52** | **0** | **2** |
