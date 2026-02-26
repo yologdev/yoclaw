@@ -22,6 +22,7 @@ pub struct MemoryEntry {
 pub fn decay_half_life(category: &str) -> Option<f64> {
     match category {
         "task" => Some(7.0),
+        "context" => Some(14.0), // compacted conversation context
         "event" => Some(14.0),
         "fact" => Some(30.0),
         "reflection" => Some(60.0),
@@ -118,6 +119,33 @@ impl Db {
             Ok(())
         })
         .await
+    }
+
+    /// Store compacted conversation context as a memory entry (sync, for compaction).
+    /// Called from `CompactionStrategy::compact()` which is sync. Uses `block_in_place`
+    /// to signal the tokio runtime before blocking on the connection mutex.
+    pub fn memory_store_compacted(
+        &self,
+        content: &str,
+        source: &str,
+        dropped_count: usize,
+    ) -> Result<i64, DbError> {
+        let ts = now_ms();
+        let tags = format!("compaction,dropped:{}", dropped_count);
+        tokio::task::block_in_place(|| {
+            self.exec_sync(|conn| {
+                memory_store_sync(
+                    conn,
+                    Some(source),
+                    content,
+                    Some(&tags),
+                    Some(source),
+                    "context",
+                    3,
+                    ts,
+                )
+            })
+        })
     }
 
     /// Update access tracking for a set of memory IDs (called after search results are returned).
@@ -603,6 +631,7 @@ mod tests {
     #[test]
     fn test_decay_half_lives() {
         assert_eq!(decay_half_life("task"), Some(7.0));
+        assert_eq!(decay_half_life("context"), Some(14.0));
         assert_eq!(decay_half_life("preference"), Some(90.0));
         assert_eq!(decay_half_life("decision"), None);
     }

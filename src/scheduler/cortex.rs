@@ -381,6 +381,7 @@ mod tests {
             provider: "anthropic".to_string(),
             model: "mock".to_string(),
             api_key: "test-key".to_string(),
+            context: Default::default(),
         }
     }
 

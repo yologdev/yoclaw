@@ -1,3 +1,4 @@
+pub mod compaction;
 pub mod delegate;
 pub mod tools;
 
@@ -167,6 +168,10 @@ impl Conductor {
                 ctx_config.tool_output_max_lines = max_lines;
             }
             agent = agent.with_context_config(ctx_config);
+            agent = agent.with_compaction_strategy(compaction::MemoryAwareCompaction::new(
+                db.clone(),
+                session_id_ref.clone(),
+            ));
             tracing::info!("Context management enabled");
         }
 
