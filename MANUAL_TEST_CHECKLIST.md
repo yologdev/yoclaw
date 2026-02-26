@@ -1,7 +1,7 @@
 # yoclaw Manual Test Checklist
 
 > Generated 2026-02-25. All 144 automated tests pass. This covers the 54 manual integration tests.
-> Last manual test run: 2026-02-26 (46 passed via Telegram+CLI, 8 skipped — Discord/Slack not configured, memory-decay untested).
+> Last manual test run: 2026-02-26 (50 passed via Telegram+CLI+Discord, 4 skipped — Slack not configured, memory-decay untested).
 
 ## Prerequisites
 
@@ -61,19 +61,19 @@ Check the tape for that group session. Expected: full conversation history prese
 
 | # | Test | Status |
 |---|------|--------|
-| 1 | **Basic message** | [ ] |
+| 1 | **Basic message** | [x] |
 
 Send in a guild channel where bot is present. Expected: bot responds.
 
-| 2 | **Guild/user allowlist** | [ ] |
+| 2 | **Guild/user allowlist** | [x] |
 
-Send from a non-allowed guild. Expected: message ignored.
+Send from a non-allowed guild (change `allowed_guilds` to a different ID, restart). Expected: message ignored.
 
-| 3 | **Worker routing** | [ ] |
+| 3 | **Worker routing** | [x] |
 
 Send in a channel mapped to a worker via `routing` config. Expected: delegated to correct worker, response from worker.
 
-| 4 | **Message splitting** | [ ] |
+| 4 | **Message splitting** | [x] |
 
 Trigger >2000 char response. Expected: split correctly at Discord's limit.
 
@@ -431,7 +431,7 @@ Expected: session stops after 2 agent turns.
 | Category | Total | Passed | Failed | Skipped |
 |----------|-------|--------|--------|---------|
 | B1. Telegram | 7 | 7 | 0 | 0 |
-| B2. Discord | 4 | 0 | 0 | 4 |
+| B2. Discord | 4 | 4 | 0 | 0 |
 | B3. Slack | 3 | 0 | 0 | 3 |
 | B4. send_message | 2 | 2 | 0 | 0 |
 | B5. Injection | 4 | 4 | 0 | 0 |
@@ -442,4 +442,4 @@ Expected: session stops after 2 agent turns.
 | B10. CLI | 5 | 5 | 0 | 0 |
 | B11. Memory | 3 | 2 | 0 | 1 |
 | B12. Security | 5 | 5 | 0 | 0 |
-| **Total** | **54** | **46** | **0** | **8** |
+| **Total** | **54** | **50** | **0** | **4** |
