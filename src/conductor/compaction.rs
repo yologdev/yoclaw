@@ -194,8 +194,8 @@ mod tests {
         assert_eq!(memories, 0);
     }
 
-    #[test]
-    fn test_compaction_stores_dropped_context() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_compaction_stores_dropped_context() {
         let db = Db::open_memory().unwrap();
         let session_id = Arc::new(RwLock::new("tg-123".to_string()));
         let strategy = MemoryAwareCompaction::new(db.clone(), session_id);
@@ -272,8 +272,8 @@ mod tests {
         assert!(!text.contains("[Context compacted"));
     }
 
-    #[test]
-    fn test_large_content_truncated() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_large_content_truncated() {
         let db = Db::open_memory().unwrap();
         let session_id = Arc::new(RwLock::new("tg-456".to_string()));
         let strategy = MemoryAwareCompaction::new(db.clone(), session_id);

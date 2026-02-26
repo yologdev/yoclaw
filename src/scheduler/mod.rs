@@ -14,6 +14,8 @@ pub struct AgentRunConfig {
     pub provider: String,
     pub model: String,
     pub api_key: String,
+    /// Context window settings from user config (for persistent agents).
+    pub context: crate::config::ContextConfig,
 }
 
 /// Unified scheduler for both cortex maintenance and user-defined cron jobs.
@@ -48,6 +50,7 @@ impl Scheduler {
                 provider: config.agent.provider.clone(),
                 model: config.agent.model.clone(),
                 api_key: config.agent.api_key.clone(),
+                context: config.agent.context.clone(),
             },
             delivery_tx,
         }
@@ -87,6 +90,7 @@ impl Scheduler {
                     provider: self.agent_config.provider.clone(),
                     model: cortex_model,
                     api_key: self.agent_config.api_key.clone(),
+                    context: Default::default(),
                 };
                 match cortex::run_maintenance(&self.db, &cortex_agent).await {
                     Ok(summary) => {
@@ -252,8 +256,32 @@ pub async fn run_persistent_prompt(
         tools: Vec::new(),
     };
 
-    let session_id_ref = std::sync::Arc::new(std::sync::RwLock::new(session_id.to_string()));
-    let compaction = MemoryAwareCompaction::new(db.clone(), session_id_ref);
+    // Build context config + compaction strategy from user config (mirrors Conductor logic)
+    let ctx = &agent_config.context;
+    let has_context_config = ctx.max_context_tokens.is_some()
+        || ctx.keep_recent.is_some()
+        || ctx.tool_output_max_lines.is_some();
+    let (context_config, compaction_strategy) = if has_context_config {
+        let mut cc = ContextConfig::default();
+        if let Some(max) = ctx.max_context_tokens {
+            cc.max_context_tokens = max as usize;
+        }
+        if let Some(keep) = ctx.keep_recent {
+            cc.keep_recent = keep;
+        }
+        if let Some(max_lines) = ctx.tool_output_max_lines {
+            cc.tool_output_max_lines = max_lines;
+        }
+        let session_id_ref = std::sync::Arc::new(std::sync::RwLock::new(session_id.to_string()));
+        let compaction = MemoryAwareCompaction::new(db.clone(), session_id_ref);
+        (
+            Some(cc),
+            Some(std::sync::Arc::new(compaction)
+                as std::sync::Arc<dyn yoagent::context::CompactionStrategy>),
+        )
+    } else {
+        (None, None)
+    };
 
     let config = AgentLoopConfig {
         provider: provider_ref,
@@ -266,14 +294,8 @@ pub async fn run_persistent_prompt(
         transform_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
-        context_config: Some(ContextConfig {
-            max_context_tokens: 80_000,
-            system_prompt_tokens: 1_000,
-            keep_recent: 6,
-            keep_first: 2,
-            tool_output_max_lines: 30,
-        }),
-        compaction_strategy: Some(std::sync::Arc::new(compaction)),
+        context_config,
+        compaction_strategy,
         input_filters: Vec::new(),
         execution_limits: Some(ExecutionLimits {
             max_turns: 5,
