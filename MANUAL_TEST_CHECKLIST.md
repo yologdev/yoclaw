@@ -1,6 +1,7 @@
 # yoclaw Manual Test Checklist
 
-> Generated 2026-02-25. All 134 automated tests pass. This covers the 54 manual integration tests.
+> Generated 2026-02-25. All 144 automated tests pass. This covers the 54 manual integration tests.
+> Last manual test run: 2026-02-26 (6 passed via CLI, 48 require live infrastructure).
 
 ## Prerequisites
 
@@ -272,7 +273,7 @@ Run long enough for cortex interval (check `cortex_interval_secs` in config). Ex
 
 | # | Test | Status |
 |---|------|--------|
-| 1 | **Skill loading** | [ ] |
+| 1 | **Skill loading** | [x] |
 
 Create a test skill:
 ```bash
@@ -291,7 +292,7 @@ yoclaw inspect --skills
 ```
 Expected: test-skill appears in loaded list.
 
-| 2 | **Skill filtering** | [ ] |
+| 2 | **Skill filtering** | [x] |
 
 Create a skill requiring a disabled tool:
 ```bash
@@ -305,7 +306,12 @@ tools: [shell]
 This skill needs shell access.
 EOF
 ```
-Disable `shell` in security config, then check `yoclaw inspect --skills`. Expected: skill excluded from loaded list.
+Disable `shell` in security config:
+```toml
+[security.tools.shell]
+enabled = false
+```
+Then check `yoclaw inspect --skills`. Expected: skill excluded from loaded list.
 
 | 3 | **Skill in prompt** | [ ] |
 
@@ -317,7 +323,7 @@ With test-skill loaded, ask the bot about testing. Expected: agent uses skill in
 
 | # | Test | Status |
 |---|------|--------|
-| 1 | **`yoclaw init`** | [ ] |
+| 1 | **`yoclaw init`** | [x] |
 
 Run in a fresh environment (backup and remove `~/.yoclaw` first):
 ```bash
@@ -327,21 +333,21 @@ ls ~/.yoclaw/
 ```
 Expected: creates `config.toml`, `persona.md`, `skills/` directory. **Restore after:** `rm -rf ~/.yoclaw && mv ~/.yoclaw.bak ~/.yoclaw`
 
-| 2 | **`yoclaw inspect`** | [ ] |
+| 2 | **`yoclaw inspect`** | [x] |
 
 ```bash
 yoclaw inspect
 ```
 Expected: shows queue status, sessions, budget, audit summary.
 
-| 3 | **`yoclaw inspect --skills`** | [ ] |
+| 3 | **`yoclaw inspect --skills`** | [x] |
 
 ```bash
 yoclaw inspect --skills
 ```
 Expected: shows loaded skills list.
 
-| 4 | **`yoclaw inspect --workers`** | [ ] |
+| 4 | **`yoclaw inspect --workers`** | [x] |
 
 ```bash
 yoclaw inspect --workers
@@ -394,8 +400,8 @@ If shell is enabled, prompt the bot to run a dangerous command (e.g. `rm -rf /`)
 
 Disable `shell` in config:
 ```toml
-[security]
-disabled_tools = ["shell"]
+[security.tools.shell]
+enabled = false
 ```
 Expected: all shell tool calls rejected.
 
@@ -427,16 +433,16 @@ Expected: session stops after 2 agent turns.
 
 | Category | Total | Passed | Failed | Skipped |
 |----------|-------|--------|--------|---------|
-| B1. Telegram | 7 | | | |
-| B2. Discord | 4 | | | |
-| B3. Slack | 3 | | | |
-| B4. send_message | 2 | | | |
-| B5. Injection | 4 | | | |
-| B6. Hot-reload | 7 | | | |
-| B7. Web UI | 7 | | | |
-| B8. Scheduler | 4 | | | |
-| B9. Skills | 3 | | | |
-| B10. CLI | 5 | | | |
-| B11. Memory | 3 | | | |
-| B12. Security | 5 | | | |
-| **Total** | **54** | | | |
+| B1. Telegram | 7 | 0 | 0 | 7 |
+| B2. Discord | 4 | 0 | 0 | 4 |
+| B3. Slack | 3 | 0 | 0 | 3 |
+| B4. send_message | 2 | 0 | 0 | 2 |
+| B5. Injection | 4 | 0 | 0 | 4 |
+| B6. Hot-reload | 7 | 0 | 0 | 7 |
+| B7. Web UI | 7 | 0 | 0 | 7 |
+| B8. Scheduler | 4 | 0 | 0 | 4 |
+| B9. Skills | 3 | 2 | 0 | 1 |
+| B10. CLI | 5 | 4 | 0 | 1 |
+| B11. Memory | 3 | 0 | 0 | 3 |
+| B12. Security | 5 | 0 | 0 | 5 |
+| **Total** | **54** | **6** | **0** | **48** |
