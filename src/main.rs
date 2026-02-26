@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Init) => run_init(),
+        Some(Commands::Init) => run_init(cli.config.as_deref()),
         Some(Commands::Inspect {
             session,
             skills,
@@ -69,12 +69,21 @@ async fn main() -> anyhow::Result<()> {
 // Init
 // ---------------------------------------------------------------------------
 
-fn run_init() -> anyhow::Result<()> {
-    let dir = yoclaw::config::config_dir();
+fn run_init(config_override: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let dir = match config_override {
+        Some(p) => p
+            .parent()
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(yoclaw::config::config_dir),
+        None => yoclaw::config::config_dir(),
+    };
     std::fs::create_dir_all(&dir)?;
     std::fs::create_dir_all(dir.join("skills"))?;
 
-    let config_path = dir.join("config.toml");
+    let config_path = match config_override {
+        Some(p) => p.to_path_buf(),
+        None => dir.join("config.toml"),
+    };
     if !config_path.exists() {
         std::fs::write(
             &config_path,
