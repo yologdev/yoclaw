@@ -156,13 +156,15 @@ impl Conductor {
                 if total > 0 {
                     let sid = session_id_usage.read().unwrap().clone();
                     let ts = crate::db::now_ms() as i64;
-                    let _ = db_usage.exec_sync(|conn| {
-                        conn.execute(
-                            "INSERT INTO audit (session_id, event_type, tokens_used, timestamp) \
-                             VALUES (?1, ?2, ?3, ?4)",
-                            rusqlite::params![sid, "llm_usage", total as i64, ts],
-                        )?;
-                        Ok(())
+                    let _ = tokio::task::block_in_place(|| {
+                        db_usage.exec_sync(|conn| {
+                            conn.execute(
+                                "INSERT INTO audit (session_id, event_type, tokens_used, timestamp) \
+                                 VALUES (?1, ?2, ?3, ?4)",
+                                rusqlite::params![sid, "llm_usage", total as i64, ts],
+                            )?;
+                            Ok(())
+                        })
                     });
                 }
             });
@@ -315,6 +317,8 @@ impl Conductor {
                 .db
                 .audit_log(Some(session_id), "input_rejected", None, Some(reason), 0)
                 .await;
+            // Clear group catchup prefix to prevent stale prefix on next message
+            self.group_catchup_prefix.clear();
             return Ok("I can't process that message.".to_string());
         }
 
