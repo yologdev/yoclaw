@@ -1,7 +1,7 @@
 # yoclaw Manual Test Checklist
 
 > Generated 2026-02-25. All 144 automated tests pass. This covers the 54 manual integration tests.
-> Last manual test run: 2026-02-26 (40 passed via Telegram+CLI, 14 skipped — Discord/Slack not configured, cron/send_message/SSE/memory-decay untested).
+> Last manual test run: 2026-02-26 (43 passed via Telegram+CLI, 11 skipped — Discord/Slack not configured, send_message/SSE/memory-decay untested).
 
 ## Prerequisites
 
@@ -241,25 +241,26 @@ Check queue section during message processing. Expected: shows pending message c
 
 | # | Test | Status |
 |---|------|--------|
-| 1 | **Config cron job** | [ ] |
+| 1 | **Config cron job** | [x] |
 
-Add a job to `[scheduler.cron]` in config:
+Add a job to `[[scheduler.cron.jobs]]` in config:
 ```toml
-[scheduler.cron.test_job]
-schedule = "*/5 * * * *"
-prompt = "Say hello"
+[[scheduler.cron.jobs]]
+name = "test-cron"
+schedule = "* * * * *"
+prompt = "Say 'Cron test successful!'"
 target = "tg-<your_chat_id>"
 ```
-Restart. Expected: job synced to DB on startup, runs every 5 minutes.
+Restart. Expected: job synced to DB on startup, runs every minute.
 
-| 2 | **Conversational cron** | [ ] |
+| 2 | **Conversational cron** | [x] |
 
 Ask the bot:
-> "Remind me every day at 9am to check my emails"
+> "Create a new cron job called 'hello-test' that runs every 2 minutes and says hello"
 
-Expected: bot creates cron job via CronScheduleTool.
+Expected: bot creates cron job via CronScheduleTool, auto-fills target with current session_id.
 
-| 3 | **Cron delivery** | [ ] |
+| 3 | **Cron delivery** | [x] |
 
 Wait for a cron job to trigger. Expected: response delivered to target channel.
 
@@ -440,9 +441,9 @@ Expected: session stops after 2 agent turns.
 | B5. Injection | 4 | 4 | 0 | 0 |
 | B6. Hot-reload | 7 | 7 | 0 | 0 |
 | B7. Web UI | 7 | 6 | 0 | 1 |
-| B8. Scheduler | 4 | 1 | 0 | 3 |
+| B8. Scheduler | 4 | 4 | 0 | 0 |
 | B9. Skills | 3 | 3 | 0 | 0 |
 | B10. CLI | 5 | 5 | 0 | 0 |
 | B11. Memory | 3 | 2 | 0 | 1 |
 | B12. Security | 5 | 5 | 0 | 0 |
-| **Total** | **54** | **40** | **0** | **14** |
+| **Total** | **54** | **43** | **0** | **11** |
