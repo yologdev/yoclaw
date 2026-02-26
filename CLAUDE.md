@@ -30,7 +30,7 @@ Channel (Telegram/Discord/Slack) → MessageCoalescer (debounce) → Queue (SQLi
 
 ### Key constraint
 
-`Agent::prompt()` takes `&mut self` — only one session processes at a time. The Conductor switches sessions by saving/loading conversation state to the tape table (`save_messages` → `clear_messages` → `restore_messages`).
+`Agent::prompt()` takes `&mut self` — only one session processes at a time. The Conductor switches sessions by saving/loading conversation state to the tape table (`save_messages` → `clear_messages` → `restore_messages`). This means concurrent messages are queued and processed sequentially. Fine for personal/small-team use, but does not scale horizontally. Scaling would require running multiple yoclaw instances, each with its own agent.
 
 ### Module responsibilities
 
