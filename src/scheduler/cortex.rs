@@ -225,8 +225,8 @@ async fn consolidate_memories(
                 let ts = now_ms() as i64;
                 db.exec(move |conn| {
                     conn.execute(
-                        "INSERT OR REPLACE INTO state (key, value) VALUES (?1, ?2)",
-                        rusqlite::params![key, ts.to_string()],
+                        "INSERT OR REPLACE INTO state (key, value, updated_at) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![key, ts.to_string(), ts],
                     )?;
                     Ok(())
                 })
@@ -327,8 +327,8 @@ async fn index_recent_sessions(
                     let key = key.clone();
                     move |conn| {
                         conn.execute(
-                            "INSERT OR REPLACE INTO state (key, value) VALUES (?1, ?2)",
-                            rusqlite::params![key, ts.to_string()],
+                            "INSERT OR REPLACE INTO state (key, value, updated_at) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![key, ts.to_string(), ts],
                         )?;
                         Ok(())
                     }

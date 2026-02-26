@@ -140,6 +140,8 @@ impl Conductor {
         // 8. Build agent — workers are included in wrapped_tools, no with_sub_agent needed
         let budget_check = budget.clone();
         let budget_record = budget.clone();
+        let db_usage = db.clone();
+        let session_id_usage = session_id_ref.clone();
         let mut agent = Agent::new(provider)
             .with_system_prompt(&persona)
             .with_model(&config.agent.model)
@@ -149,6 +151,20 @@ impl Conductor {
             .on_after_turn(move |_messages, usage| {
                 budget_record.record_usage(usage.input, usage.output);
                 budget_record.record_turn();
+                // Persist token usage to audit table so budget survives restarts
+                let total = usage.input + usage.output;
+                if total > 0 {
+                    let sid = session_id_usage.read().unwrap().clone();
+                    let ts = crate::db::now_ms() as i64;
+                    let _ = db_usage.exec_sync(|conn| {
+                        conn.execute(
+                            "INSERT INTO audit (session_id, event_type, tokens_used, timestamp) \
+                             VALUES (?1, ?2, ?3, ?4)",
+                            rusqlite::params![sid, "llm_usage", total as i64, ts],
+                        )?;
+                        Ok(())
+                    });
+                }
             });
 
         // 8a. Wire up context management from config
@@ -299,6 +315,7 @@ impl Conductor {
                 .db
                 .audit_log(Some(session_id), "input_rejected", None, Some(reason), 0)
                 .await;
+            return Ok("I can't process that message.".to_string());
         }
 
         // Persist conversation state — reconstruct full tape if group catchup trimmed a prefix
