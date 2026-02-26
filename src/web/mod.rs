@@ -40,15 +40,18 @@ async fn static_handler(uri: axum::http::Uri) -> impl axum::response::IntoRespon
     let path = uri.path().trim_start_matches('/');
 
     // For SPA routing, return index.html for non-API, non-asset paths
-    let content = if path.is_empty() || !path.contains('.') {
-        StaticAssets::get("index.html")
+    let (content, mime_path) = if path.is_empty() || !path.contains('.') {
+        (StaticAssets::get("index.html"), "index.html")
     } else {
-        StaticAssets::get(path).or_else(|| StaticAssets::get("index.html"))
+        (
+            StaticAssets::get(path).or_else(|| StaticAssets::get("index.html")),
+            path,
+        )
     };
 
     match content {
         Some(file) => {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            let mime = mime_guess::from_path(mime_path).first_or_octet_stream();
             (
                 [(axum::http::header::CONTENT_TYPE, mime.as_ref())],
                 file.data.to_vec(),
