@@ -1,7 +1,7 @@
 # yoclaw Manual Test Checklist
 
 > Generated 2026-02-25. All 144 automated tests pass. This covers the 54 manual integration tests.
-> Last manual test run: 2026-02-26 (52 passed via Telegram+CLI+Discord+Slack, 2 skipped — Slack DM workspace restriction, memory-decay untested).
+> Last manual test run: 2026-02-26 (53 passed via Telegram+CLI+Discord+Slack, 1 skipped — Slack DM workspace restriction).
 
 ## Prerequisites
 
@@ -375,7 +375,7 @@ Then later ask:
 
 Expected: bot stores via MemoryStoreTool, retrieves via MemorySearchTool.
 
-| 2 | **Decay over time** | [ ] |
+| 2 | **Decay over time** | [x] |
 
 Store a memory, wait some time, then search again. Check via `yoclaw inspect` that the score decreases with age (rate depends on category half-life).
 
@@ -440,6 +440,6 @@ Expected: session stops after 2 agent turns.
 | B8. Scheduler | 4 | 4 | 0 | 0 |
 | B9. Skills | 3 | 3 | 0 | 0 |
 | B10. CLI | 5 | 5 | 0 | 0 |
-| B11. Memory | 3 | 2 | 0 | 1 |
+| B11. Memory | 3 | 3 | 0 | 0 |
 | B12. Security | 5 | 5 | 0 | 0 |
-| **Total** | **54** | **52** | **0** | **2** |
+| **Total** | **54** | **53** | **0** | **1** |

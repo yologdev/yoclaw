@@ -247,7 +247,13 @@ fn memory_search_sync(
     let fetch_limit = limit * 3; // over-fetch for re-ranking
 
     // 1. FTS5 search (with LIKE fallback)
-    let safe_query = format!("\"{}\"", query.replace('"', "\"\""));
+    // Use prefix matching (word*) so "weekend" matches "weekends", joined with OR
+    // so any matching term finds results. Quotes protect against FTS5 injection.
+    let safe_query: String = query
+        .split_whitespace()
+        .map(|w| format!("\"{}\"*", w.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
     let fts_entries = match memory_search_fts(conn, &safe_query, fetch_limit) {
         Ok(entries) => entries,
         Err(_) => memory_search_like(conn, query, fetch_limit)?,
