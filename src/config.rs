@@ -83,6 +83,12 @@ pub struct WorkersConfig {
     pub model: Option<String>,
     /// Default max_tokens for workers
     pub max_tokens: Option<u32>,
+    /// Max concurrent dynamic workers (default: 3)
+    #[serde(default = "default_max_concurrent_workers")]
+    pub max_concurrent: usize,
+    /// Max turns per dynamic worker (default: 15)
+    #[serde(default = "default_max_worker_turns")]
+    pub max_worker_turns: usize,
 
     /// Named worker overrides — populated via custom deserialization
     #[serde(flatten)]
@@ -117,6 +123,9 @@ pub struct TelegramConfig {
     pub allowed_senders: Vec<i64>,
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
+    /// Debounce interval for streaming edits (ms). Default: 300.
+    #[serde(default = "default_stream_debounce_ms")]
+    pub stream_debounce_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -128,6 +137,9 @@ pub struct DiscordConfig {
     pub allowed_users: Vec<u64>,
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
+    /// Debounce interval for streaming edits (ms). Default: 300.
+    #[serde(default = "default_stream_debounce_ms")]
+    pub stream_debounce_ms: u64,
     /// Channel name → worker routing rules
     #[serde(default)]
     pub routing: HashMap<String, ChannelRoute>,
@@ -150,6 +162,9 @@ pub struct SlackConfig {
     pub allowed_users: Vec<String>,
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
+    /// Debounce interval for streaming edits (ms). Default: 300.
+    #[serde(default = "default_stream_debounce_ms")]
+    pub stream_debounce_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +210,23 @@ pub struct InjectionConfig {
     /// Additional patterns to match (appended to built-in set).
     #[serde(default)]
     pub extra_patterns: Vec<String>,
+    /// Heuristic score threshold (0.0–1.0) for blocking/warning. Default: 0.6.
+    #[serde(default = "default_heuristic_threshold")]
+    pub heuristic_threshold: f64,
+    /// Enable optional LLM judge for borderline cases.
+    #[serde(default)]
+    pub llm_judge: bool,
+    /// Provider for the LLM judge (uses main provider if not set).
+    #[serde(default)]
+    pub llm_judge_provider: Option<String>,
+    /// Model for the LLM judge (cheap/fast model recommended).
+    #[serde(default)]
+    pub llm_judge_model: Option<String>,
+    /// Heuristic score threshold above which the LLM judge is consulted.
+    /// Messages scoring between this and `heuristic_threshold` are sent to the judge.
+    /// Default: 0.4.
+    #[serde(default = "default_llm_judge_threshold")]
+    pub llm_judge_threshold: f64,
 }
 
 impl Default for InjectionConfig {
@@ -203,6 +235,11 @@ impl Default for InjectionConfig {
             enabled: false,
             action: default_injection_action(),
             extra_patterns: Vec::new(),
+            heuristic_threshold: default_heuristic_threshold(),
+            llm_judge: false,
+            llm_judge_provider: None,
+            llm_judge_model: None,
+            llm_judge_threshold: default_llm_judge_threshold(),
         }
     }
 }
@@ -331,6 +368,18 @@ fn default_debounce_ms() -> u64 {
     2000
 }
 
+fn default_stream_debounce_ms() -> u64 {
+    300
+}
+
+fn default_max_concurrent_workers() -> usize {
+    3
+}
+
+fn default_max_worker_turns() -> usize {
+    15
+}
+
 fn default_db_path() -> String {
     "~/.yoclaw/yoclaw.db".to_string()
 }
@@ -369,6 +418,14 @@ fn default_max_group_catchup() -> usize {
 
 fn default_injection_action() -> String {
     "warn".to_string()
+}
+
+fn default_heuristic_threshold() -> f64 {
+    0.6
+}
+
+fn default_llm_judge_threshold() -> f64 {
+    0.4
 }
 
 // ---------------------------------------------------------------------------

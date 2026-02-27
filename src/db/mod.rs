@@ -6,6 +6,7 @@ pub mod tape;
 pub mod vector;
 
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -104,6 +105,10 @@ impl Db {
             "003_scheduler",
             include_str!("../../migrations/003_scheduler.sql"),
         ),
+        (
+            "004_saved_workers",
+            include_str!("../../migrations/004_saved_workers.sql"),
+        ),
     ];
 
     fn run_migrations(&self) -> Result<(), DbError> {
@@ -132,6 +137,92 @@ impl Db {
             }
         }
         Ok(())
+    }
+}
+
+// -- Saved workers --
+
+/// A saved dynamic worker definition.
+#[derive(Debug, Clone)]
+pub struct SavedWorker {
+    pub name: String,
+    pub system_prompt: String,
+    pub created_at: u64,
+}
+
+impl Db {
+    /// List all saved workers.
+    pub async fn saved_workers_list(&self) -> Result<Vec<SavedWorker>, DbError> {
+        self.exec(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name, system_prompt, created_at FROM saved_workers ORDER BY name",
+            )?;
+            let workers = stmt
+                .query_map([], |row| {
+                    Ok(SavedWorker {
+                        name: row.get(0)?,
+                        system_prompt: row.get(1)?,
+                        created_at: row.get::<_, i64>(2)? as u64,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(workers)
+        })
+        .await
+    }
+
+    /// Get a saved worker by name.
+    pub async fn saved_workers_get(&self, name: &str) -> Result<Option<SavedWorker>, DbError> {
+        let name = name.to_string();
+        self.exec(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name, system_prompt, created_at FROM saved_workers WHERE name = ?1",
+            )?;
+            let worker = stmt
+                .query_row(rusqlite::params![name], |row| {
+                    Ok(SavedWorker {
+                        name: row.get(0)?,
+                        system_prompt: row.get(1)?,
+                        created_at: row.get::<_, i64>(2)? as u64,
+                    })
+                })
+                .optional()?;
+            Ok(worker)
+        })
+        .await
+    }
+
+    /// Upsert a saved worker.
+    pub async fn saved_workers_upsert(
+        &self,
+        name: &str,
+        system_prompt: &str,
+    ) -> Result<(), DbError> {
+        let name = name.to_string();
+        let system_prompt = system_prompt.to_string();
+        let now = now_ms() as i64;
+        self.exec(move |conn| {
+            conn.execute(
+                "INSERT INTO saved_workers (name, system_prompt, created_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(name) DO UPDATE SET system_prompt = excluded.system_prompt",
+                rusqlite::params![name, system_prompt, now],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Remove a saved worker by name. Returns true if deleted.
+    pub async fn saved_workers_remove(&self, name: &str) -> Result<bool, DbError> {
+        let name = name.to_string();
+        self.exec(move |conn| {
+            let rows = conn.execute(
+                "DELETE FROM saved_workers WHERE name = ?1",
+                rusqlite::params![name],
+            )?;
+            Ok(rows > 0)
+        })
+        .await
     }
 }
 
@@ -175,7 +266,7 @@ mod tests {
         db.exec_sync(|conn| {
             let count: i64 =
                 conn.query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))?;
-            assert_eq!(count, 3); // 001_initial + 002_vector_memory + 003_scheduler
+            assert_eq!(count, 4); // 001_initial + 002_vector_memory + 003_scheduler + 004_saved_workers
             Ok(())
         })
         .unwrap();

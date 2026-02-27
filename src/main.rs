@@ -402,19 +402,68 @@ async fn run_main(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
             truncate(&incoming.content, 80)
         );
 
-        // Start typing indicator
-        let typing_handle = adapters
+        // Find the adapter for this channel
+        let adapter = adapters
             .iter()
             .find(|a| a.name() == incoming.channel)
-            .and_then(|a| a.start_typing(&incoming.session_id));
+            .cloned();
+
+        // Start typing indicator
+        let typing_handle = adapter.as_ref().and_then(|a| a.start_typing(&incoming.session_id));
+
+        // Send a streaming placeholder message
+        let placeholder = if let Some(ref adapter) = adapter {
+            adapter.send_placeholder(&incoming.session_id, "...").await
+        } else {
+            None
+        };
+
+        // Build debounced on_chunk callback for streaming edits
+        let on_chunk: Option<yoclaw::conductor::OnStreamChunk> = {
+            if let (Some(ref ph), Some(ref adapter)) = (&placeholder, &adapter) {
+                let ph = ph.clone();
+                let adapter = adapter.clone();
+                // Get stream debounce from current config
+                let debounce_ms = match incoming.channel.as_str() {
+                    "telegram" => current_config.channels.telegram.as_ref().map(|c| c.stream_debounce_ms).unwrap_or(300),
+                    "discord" => current_config.channels.discord.as_ref().map(|c| c.stream_debounce_ms).unwrap_or(300),
+                    "slack" => current_config.channels.slack.as_ref().map(|c| c.stream_debounce_ms).unwrap_or(300),
+                    _ => 300,
+                };
+                let debounce = Duration::from_millis(debounce_ms);
+                let last_edit = Arc::new(std::sync::Mutex::new(std::time::Instant::now() - debounce));
+                // Also emit SSE events for web UI streaming
+                let sse_tx = sse_tx_clone.clone();
+                let sse_session = incoming.session_id.clone();
+                let sse_channel = incoming.channel.clone();
+
+                Some(Box::new(move |accumulated: &str| {
+                    let mut last = last_edit.lock().unwrap();
+                    if last.elapsed() >= debounce {
+                        *last = std::time::Instant::now();
+                        let ph = ph.clone();
+                        let adapter = adapter.clone();
+                        let text = accumulated.to_string();
+                        tokio::spawn(async move {
+                            let _ = adapter.edit_message(&ph, &text).await;
+                        });
+                    }
+                    // Emit SSE stream chunk
+                    let _ = sse_tx.send(yoclaw::web::SseEvent::StreamChunk {
+                        session_id: sse_session.clone(),
+                        channel: sse_channel.clone(),
+                        text: accumulated.to_string(),
+                    });
+                }) as yoclaw::conductor::OnStreamChunk)
+            } else {
+                None
+            }
+        };
 
         // Build progress callback to route send_message tool output to the channel
         let on_progress: Option<Box<dyn Fn(String) + Send + Sync>> = {
-            let adapter = adapters
-                .iter()
-                .find(|a| a.name() == incoming.channel)
-                .cloned();
-            if let Some(adapter) = adapter {
+            if let Some(ref adapter) = adapter {
+                let adapter = adapter.clone();
                 let channel = incoming.channel.clone();
                 let session_id = incoming.session_id.clone();
                 Some(Box::new(move |text: String| {
@@ -440,11 +489,11 @@ async fn run_main(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
                 .await
         } else if incoming.is_group {
             conductor
-                .process_group_message(&incoming.session_id, &incoming.content, on_progress)
+                .process_group_message(&incoming.session_id, &incoming.content, on_chunk, on_progress)
                 .await
         } else {
             conductor
-                .process_message(&incoming.session_id, &incoming.content, on_progress)
+                .process_message(&incoming.session_id, &incoming.content, on_chunk, on_progress)
                 .await
         };
 
@@ -457,25 +506,34 @@ async fn run_main(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
             Ok(response) => {
                 tracing::info!("Response: {}", truncate(&response, 80));
 
-                let outgoing = yoclaw::channels::OutgoingMessage {
-                    channel: incoming.channel.clone(),
-                    session_id: incoming.session_id.clone(),
-                    content: response,
-                    reply_to: None,
-                };
+                // Final edit to ensure complete text if we had a placeholder
+                if let Some(ref ph) = placeholder {
+                    if let Some(ref adapter) = adapter {
+                        let _ = adapter.edit_message(ph, &response).await;
+                    }
+                } else {
+                    // No placeholder — send the full response as a new message
+                    let outgoing = yoclaw::channels::OutgoingMessage {
+                        channel: incoming.channel.clone(),
+                        session_id: incoming.session_id.clone(),
+                        content: response,
+                        reply_to: None,
+                    };
 
-                for adapter in &adapters {
-                    if adapter.name() == incoming.channel {
-                        if let Err(e) = adapter.send(outgoing.clone()).await {
+                    if let Some(ref adapter) = adapter {
+                        if let Err(e) = adapter.send(outgoing).await {
                             tracing::error!("Failed to send response: {}", e);
                         }
-                        break;
                     }
                 }
 
                 db.queue_mark_done(queue_id).await?;
 
-                // Emit SSE event for web UI
+                // Emit SSE events for web UI
+                let _ = sse_tx_clone.send(yoclaw::web::SseEvent::StreamEnd {
+                    session_id: incoming.session_id.clone(),
+                    channel: incoming.channel.clone(),
+                });
                 let _ = sse_tx_clone.send(yoclaw::web::SseEvent::MessageProcessed {
                     session_id: incoming.session_id.clone(),
                     channel: incoming.channel.clone(),

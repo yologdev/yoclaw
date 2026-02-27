@@ -1,4 +1,4 @@
-use super::{split_message, ChannelAdapter, IncomingMessage, OutgoingMessage};
+use super::{split_message, ChannelAdapter, IncomingMessage, OutgoingMessage, SentMessage};
 use crate::config::SlackConfig;
 use crate::db::now_ms;
 use async_trait::async_trait;
@@ -121,6 +121,45 @@ impl ChannelAdapter for SlackAdapter {
 
     fn name(&self) -> &str {
         "slack"
+    }
+
+    async fn send_placeholder(&self, session_id: &str, text: &str) -> Option<SentMessage> {
+        let (channel_id, thread_ts) = parse_slack_session(session_id)?;
+        let session = self.client.open_session(&self.bot_token);
+        let content = SlackMessageContent::new().with_text(text.to_string());
+        let mut request = SlackApiChatPostMessageRequest::new(SlackChannelId(channel_id), content);
+        if let Some(ref ts) = thread_ts {
+            request = request.with_thread_ts(SlackTs(ts.clone()));
+        }
+        match session.chat_post_message(&request).await {
+            Ok(resp) => Some(SentMessage {
+                channel: "slack".into(),
+                session_id: session_id.to_string(),
+                message_id: resp.ts.0,
+            }),
+            Err(e) => {
+                tracing::warn!("Failed to send Slack placeholder: {}", e);
+                None
+            }
+        }
+    }
+
+    async fn edit_message(
+        &self,
+        handle: &SentMessage,
+        new_text: &str,
+    ) -> Result<(), anyhow::Error> {
+        let (channel_id, _) = parse_slack_session(&handle.session_id)
+            .ok_or_else(|| anyhow::anyhow!("Invalid slack session_id"))?;
+        let session = self.client.open_session(&self.bot_token);
+        let content = SlackMessageContent::new().with_text(new_text.to_string());
+        let request = SlackApiChatUpdateRequest::new(
+            SlackChannelId(channel_id),
+            content,
+            SlackTs(handle.message_id.clone()),
+        );
+        session.chat_update(&request).await?;
+        Ok(())
     }
 }
 

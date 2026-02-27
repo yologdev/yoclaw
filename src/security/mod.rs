@@ -1,5 +1,7 @@
 pub mod budget;
+pub mod heuristics;
 pub mod injection;
+pub mod llm_judge;
 
 use crate::config::SecurityConfig;
 use crate::db::Db;

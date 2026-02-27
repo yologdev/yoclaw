@@ -31,6 +31,15 @@ pub struct OutgoingMessage {
     pub reply_to: Option<String>,
 }
 
+/// Handle for a sent placeholder message that can be edited in-place.
+#[derive(Debug, Clone)]
+pub struct SentMessage {
+    pub channel: String,
+    pub session_id: String,
+    /// Platform-specific message ID (e.g. Telegram message_id, Discord message_id, Slack ts).
+    pub message_id: String,
+}
+
 /// Channel adapter trait. Implement for each messaging platform.
 #[async_trait]
 pub trait ChannelAdapter: Send + Sync {
@@ -48,6 +57,21 @@ pub trait ChannelAdapter: Send + Sync {
     /// when aborted, stops the indicator. Default: no-op.
     fn start_typing(&self, _session_id: &str) -> Option<tokio::task::JoinHandle<()>> {
         None
+    }
+
+    /// Send a placeholder message that can be edited later for streaming.
+    /// Returns a handle for subsequent edits, or None if not supported.
+    async fn send_placeholder(&self, _session_id: &str, _text: &str) -> Option<SentMessage> {
+        None
+    }
+
+    /// Edit a previously sent message in-place (for streaming updates).
+    async fn edit_message(
+        &self,
+        _handle: &SentMessage,
+        _new_text: &str,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
     }
 }
 
