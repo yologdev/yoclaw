@@ -36,6 +36,10 @@ pub struct Conductor {
     group_catchup_prefix: Vec<AgentMessage>,
     /// Optional LLM judge for borderline injection cases (Layer 3).
     llm_judge: Option<crate::security::llm_judge::LlmJudge>,
+    /// Injection config thresholds for LLM judge pre-check.
+    injection_heuristic_threshold: f64,
+    injection_llm_judge_threshold: f64,
+    injection_extra_patterns: Vec<String>,
 }
 
 impl Conductor {
@@ -305,6 +309,15 @@ impl Conductor {
             max_group_catchup: config.agent.context.max_group_catchup_messages,
             group_catchup_prefix: Vec::new(),
             llm_judge,
+            injection_heuristic_threshold: config.security.injection.heuristic_threshold,
+            injection_llm_judge_threshold: config.security.injection.llm_judge_threshold,
+            injection_extra_patterns: config
+                .security
+                .injection
+                .extra_patterns
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         })
     }
 
@@ -383,10 +396,13 @@ impl Conductor {
             // Check if the text would produce the judge marker
             // by looking at the heuristic score directly
             let heuristic = crate::security::heuristics::HeuristicScorer::analyze(text);
-            let detector_check = InjectionDetector::new("warn", &[]);
+            let detector_check = InjectionDetector::new("warn", &self.injection_extra_patterns);
             let has_pattern = detector_check.analyze_patterns(text).is_some();
 
-            if !has_pattern && heuristic.score >= 0.2 && heuristic.score < 0.6 {
+            if !has_pattern
+                && heuristic.score >= self.injection_llm_judge_threshold
+                && heuristic.score < self.injection_heuristic_threshold
+            {
                 tracing::info!(
                     "Running LLM judge for borderline message (heuristic score: {:.2})",
                     heuristic.score
@@ -407,6 +423,7 @@ impl Conductor {
                                 0,
                             )
                             .await;
+                        self.group_catchup_prefix.clear();
                         return Ok("I can't process that message.".to_string());
                     }
                     crate::security::llm_judge::JudgeVerdict::Safe => {
@@ -758,6 +775,9 @@ api_key = "test-key"
             max_group_catchup: 50,
             group_catchup_prefix: Vec::new(),
             llm_judge: None,
+            injection_heuristic_threshold: 0.6,
+            injection_llm_judge_threshold: 0.4,
+            injection_extra_patterns: vec![],
         };
 
         (conductor, db)
@@ -803,6 +823,9 @@ api_key = "test-key"
             max_group_catchup: 50,
             group_catchup_prefix: Vec::new(),
             llm_judge: None,
+            injection_heuristic_threshold: 0.6,
+            injection_llm_judge_threshold: 0.4,
+            injection_extra_patterns: vec![],
         };
 
         // Send a message
@@ -931,6 +954,9 @@ api_key = "test-key"
             max_group_catchup: 50,
             group_catchup_prefix: Vec::new(),
             llm_judge: None,
+            injection_heuristic_threshold: 0.6,
+            injection_llm_judge_threshold: 0.4,
+            injection_extra_patterns: vec![],
         };
 
         let response = conductor
@@ -1185,6 +1211,9 @@ api_key = "test-key"
             max_group_catchup: 50,
             group_catchup_prefix: Vec::new(),
             llm_judge: None,
+            injection_heuristic_threshold: 0.6,
+            injection_llm_judge_threshold: 0.4,
+            injection_extra_patterns: vec![],
         };
 
         // Process a group message — should use catchup slicing

@@ -411,9 +411,13 @@ async fn run_main(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
         // Start typing indicator
         let typing_handle = adapter.as_ref().and_then(|a| a.start_typing(&incoming.session_id));
 
-        // Send a streaming placeholder message
-        let placeholder = if let Some(ref adapter) = adapter {
-            adapter.send_placeholder(&incoming.session_id, "...").await
+        // Send a streaming placeholder message (skip for worker delegations — no streaming)
+        let placeholder = if incoming.worker_hint.is_none() {
+            if let Some(ref adapter) = adapter {
+                adapter.send_placeholder(&incoming.session_id, "...").await
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -541,6 +545,14 @@ async fn run_main(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
             }
             Err(e) => {
                 tracing::error!("Processing error: {}", e);
+                // Clean up streaming placeholder on error
+                if let Some(ref ph) = placeholder {
+                    if let Some(ref adapter) = adapter {
+                        let _ = adapter
+                            .edit_message(ph, "An error occurred processing your message.")
+                            .await;
+                    }
+                }
                 db.queue_mark_failed(queue_id, &e.to_string()).await?;
             }
         }

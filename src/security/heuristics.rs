@@ -142,8 +142,14 @@ impl HeuristicScorer {
 
     /// Encoded content: base64 blocks ≥40 chars, long hex sequences, or mixed Unicode scripts → +0.2
     fn encoded_content(text: &str) -> Option<Signal> {
+        use std::sync::OnceLock;
+
+        static BASE64_RE: OnceLock<regex::Regex> = OnceLock::new();
+        static HEX_RE: OnceLock<regex::Regex> = OnceLock::new();
+
         // Check for base64-like blocks (40+ chars of [A-Za-z0-9+/=])
-        let base64_re = regex::Regex::new(r"[A-Za-z0-9+/=]{40,}").unwrap();
+        let base64_re =
+            BASE64_RE.get_or_init(|| regex::Regex::new(r"[A-Za-z0-9+/=]{40,}").unwrap());
         if base64_re.is_match(text) {
             return Some(Signal {
                 name: "encoded_content",
@@ -152,7 +158,7 @@ impl HeuristicScorer {
         }
 
         // Check for long hex sequences (40+ chars of [0-9a-fA-F])
-        let hex_re = regex::Regex::new(r"(?:0x)?[0-9a-fA-F]{40,}").unwrap();
+        let hex_re = HEX_RE.get_or_init(|| regex::Regex::new(r"(?:0x)?[0-9a-fA-F]{40,}").unwrap());
         if hex_re.is_match(text) {
             return Some(Signal {
                 name: "encoded_content",

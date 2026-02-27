@@ -212,9 +212,13 @@ impl ChannelAdapter for DiscordAdapter {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Discord HTTP client not ready"))?;
 
-        // Discord max message length is 2000 — truncate if needed
+        // Discord max message length is 2000 — truncate at char boundary
         let text = if new_text.len() > 2000 {
-            &new_text[..2000]
+            let mut end = 2000;
+            while end > 0 && !new_text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &new_text[..end]
         } else {
             new_text
         };

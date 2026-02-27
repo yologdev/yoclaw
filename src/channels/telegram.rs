@@ -134,13 +134,24 @@ impl ChannelAdapter for TelegramAdapter {
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid telegram message_id"))?;
 
+        // Telegram max message length is 4096 — truncate if needed
+        let text = if new_text.len() > 4096 {
+            let mut end = 4096;
+            while end > 0 && !new_text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &new_text[..end]
+        } else {
+            new_text
+        };
+
         // Telegram rejects edits with identical text (400 error) — just ignore
         match self
             .bot
             .edit_message_text(
                 ChatId(chat_id),
                 teloxide::types::MessageId(message_id),
-                new_text,
+                text,
             )
             .await
         {

@@ -454,7 +454,11 @@ impl AgentTool for ListWorkersTool {
                 .iter()
                 .map(|w| {
                     let snippet = if w.system_prompt.len() > 80 {
-                        format!("{}...", &w.system_prompt[..80])
+                        let mut end = 80;
+                        while end > 0 && !w.system_prompt.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}...", &w.system_prompt[..end])
                     } else {
                         w.system_prompt.clone()
                     };
