@@ -15,6 +15,14 @@ pub enum SseEvent {
     MessageProcessed { session_id: String, channel: String },
     #[serde(rename = "queue_update")]
     QueueUpdate { pending: u64 },
+    #[serde(rename = "stream_chunk")]
+    StreamChunk {
+        session_id: String,
+        channel: String,
+        text: String,
+    },
+    #[serde(rename = "stream_end")]
+    StreamEnd { session_id: String, channel: String },
 }
 
 /// Shared application state for all web handlers.

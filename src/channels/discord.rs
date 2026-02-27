@@ -1,9 +1,10 @@
-use super::{split_message, ChannelAdapter, IncomingMessage, OutgoingMessage};
+use super::{split_message, ChannelAdapter, IncomingMessage, OutgoingMessage, SentMessage};
 use crate::config::DiscordConfig;
 use crate::db::now_ms;
 use async_trait::async_trait;
 use serenity::all::{
-    ChannelId, Context, CreateMessage, EventHandler, GatewayIntents, Message, Ready,
+    ChannelId, Context, CreateMessage, EditMessage, EventHandler, GatewayIntents, Message,
+    MessageId, Ready,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -167,6 +168,66 @@ impl ChannelAdapter for DiscordAdapter {
 
     fn name(&self) -> &str {
         "discord"
+    }
+
+    async fn send_placeholder(&self, session_id: &str, text: &str) -> Option<SentMessage> {
+        let channel_id: u64 = session_id
+            .strip_prefix("dc-")
+            .and_then(|s| s.parse().ok())?;
+        let http = self.http.read().await;
+        let http = http.as_ref()?;
+        let builder = CreateMessage::new().content(text);
+        match ChannelId::new(channel_id)
+            .send_message(http.as_ref(), builder)
+            .await
+        {
+            Ok(msg) => Some(SentMessage {
+                channel: "discord".into(),
+                session_id: session_id.to_string(),
+                message_id: msg.id.get().to_string(),
+            }),
+            Err(e) => {
+                tracing::warn!("Failed to send Discord placeholder: {}", e);
+                None
+            }
+        }
+    }
+
+    async fn edit_message(
+        &self,
+        handle: &SentMessage,
+        new_text: &str,
+    ) -> Result<(), anyhow::Error> {
+        let channel_id: u64 = handle
+            .session_id
+            .strip_prefix("dc-")
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("Invalid discord session_id"))?;
+        let message_id: u64 = handle
+            .message_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid discord message_id"))?;
+        let http = self.http.read().await;
+        let http = http
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Discord HTTP client not ready"))?;
+
+        // Discord max message length is 2000 — truncate at char boundary
+        let text = if new_text.len() > 2000 {
+            let mut end = 2000;
+            while end > 0 && !new_text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &new_text[..end]
+        } else {
+            new_text
+        };
+
+        let builder = EditMessage::new().content(text);
+        ChannelId::new(channel_id)
+            .edit_message(http.as_ref(), MessageId::new(message_id), builder)
+            .await?;
+        Ok(())
     }
 }
 

@@ -14,6 +14,9 @@ use yoagent::provider;
 use yoagent::types::*;
 use yoagent::Agent;
 
+/// Callback type for streaming text chunks to the client.
+pub type OnStreamChunk = Box<dyn Fn(&str) + Send + Sync>;
+
 /// The Conductor owns the yoagent Agent and mediates all interactions.
 pub struct Conductor {
     agent: Agent,
@@ -31,6 +34,12 @@ pub struct Conductor {
     /// Messages trimmed from the front during group chat catch-up.
     /// Prepended back when saving to preserve the full tape.
     group_catchup_prefix: Vec<AgentMessage>,
+    /// Optional LLM judge for borderline injection cases (Layer 3).
+    llm_judge: Option<crate::security::llm_judge::LlmJudge>,
+    /// Injection config thresholds for LLM judge pre-check.
+    injection_heuristic_threshold: f64,
+    injection_llm_judge_threshold: f64,
+    injection_extra_patterns: Vec<String>,
 }
 
 impl Conductor {
@@ -135,6 +144,38 @@ impl Conductor {
             }));
         }
 
+        // 6b. Add dynamic worker tools (spawn_worker, list_workers, remove_worker)
+        let dynamic_worker_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dynamic_provider = delegate::resolve_arc_provider(&config.agent.provider);
+        let spawn_tool = tools::SpawnWorkerTool::new(tools::SpawnWorkerConfig {
+            db: db.clone(),
+            provider: dynamic_provider,
+            model: config.agent.model.clone(),
+            api_key: config.agent.api_key.clone(),
+            worker_tools: worker_tools.clone(), // Same tools as static workers (excludes spawn_worker → no recursion)
+            active_count: dynamic_worker_active,
+            max_concurrent: config.agent.workers.max_concurrent,
+            max_turns: config.agent.workers.max_worker_turns,
+        });
+        wrapped_tools.push(Box::new(security::SecureToolWrapper {
+            inner: Box::new(spawn_tool),
+            policy: policy_ref.clone(),
+            db: db.clone(),
+            session_id: session_id_ref.clone(),
+        }));
+        wrapped_tools.push(Box::new(security::SecureToolWrapper {
+            inner: Box::new(tools::ListWorkersTool::new(db.clone())),
+            policy: policy_ref.clone(),
+            db: db.clone(),
+            session_id: session_id_ref.clone(),
+        }));
+        wrapped_tools.push(Box::new(security::SecureToolWrapper {
+            inner: Box::new(tools::RemoveWorkerTool::new(db.clone())),
+            policy: policy_ref.clone(),
+            db: db.clone(),
+            session_id: session_id_ref.clone(),
+        }));
+
         // 7. Resolve provider
         let provider = resolve_provider(&config.agent.provider);
 
@@ -196,14 +237,24 @@ impl Conductor {
 
         // 8b. Wire up injection detection if enabled
         if config.security.injection.enabled {
-            let detector = crate::security::injection::InjectionDetector::new(
-                &config.security.injection.action,
-                &config.security.injection.extra_patterns,
+            let inj = &config.security.injection;
+            let llm_judge_threshold = if inj.llm_judge {
+                Some(inj.llm_judge_threshold)
+            } else {
+                None
+            };
+            let detector = crate::security::injection::InjectionDetector::with_thresholds(
+                &inj.action,
+                &inj.extra_patterns,
+                inj.heuristic_threshold,
+                llm_judge_threshold,
             );
             agent = agent.with_input_filter(detector);
             tracing::info!(
-                "Injection detection enabled (action: {})",
-                config.security.injection.action
+                "Injection detection enabled (action: {}, heuristic_threshold: {:.2}, llm_judge: {})",
+                inj.action,
+                inj.heuristic_threshold,
+                inj.llm_judge
             );
         }
 
@@ -222,6 +273,29 @@ impl Conductor {
             agent = agent.with_thinking(level);
         }
 
+        // 9. Build optional LLM judge for borderline injection cases
+        let llm_judge = if config.security.injection.enabled && config.security.injection.llm_judge
+        {
+            let inj = &config.security.injection;
+            let judge_provider_name = inj
+                .llm_judge_provider
+                .as_deref()
+                .unwrap_or(&config.agent.provider);
+            let judge_model = inj
+                .llm_judge_model
+                .as_deref()
+                .unwrap_or("claude-haiku-4-5-20251001");
+            let judge_provider = delegate::resolve_arc_provider(judge_provider_name);
+            tracing::info!("LLM injection judge enabled (model: {})", judge_model);
+            Some(crate::security::llm_judge::LlmJudge::new(
+                judge_provider,
+                judge_model.to_string(),
+                config.agent.api_key.clone(),
+            ))
+        } else {
+            None
+        };
+
         Ok(Self {
             agent,
             db,
@@ -234,6 +308,16 @@ impl Conductor {
             direct_workers,
             max_group_catchup: config.agent.context.max_group_catchup_messages,
             group_catchup_prefix: Vec::new(),
+            llm_judge,
+            injection_heuristic_threshold: config.security.injection.heuristic_threshold,
+            injection_llm_judge_threshold: config.security.injection.llm_judge_threshold,
+            injection_extra_patterns: config
+                .security
+                .injection
+                .extra_patterns
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         })
     }
 
@@ -270,15 +354,17 @@ impl Conductor {
     }
 
     /// Process a user message and return the assistant's text response.
+    /// If `on_chunk` is provided, streaming text deltas are forwarded in real-time.
     /// If `on_progress` is provided, ProgressMessage events (from send_message tool)
-    /// are forwarded in real-time. `is_group` enables group chat catch-up slicing.
+    /// are forwarded in real-time.
     pub async fn process_message(
         &mut self,
         session_id: &str,
         text: &str,
+        on_chunk: Option<OnStreamChunk>,
         on_progress: Option<Box<dyn Fn(String) + Send + Sync>>,
     ) -> Result<String, anyhow::Error> {
-        self.process_message_inner(session_id, text, false, on_progress)
+        self.process_message_inner(session_id, text, false, on_chunk, on_progress)
             .await
     }
 
@@ -288,9 +374,10 @@ impl Conductor {
         &mut self,
         session_id: &str,
         text: &str,
+        on_chunk: Option<OnStreamChunk>,
         on_progress: Option<Box<dyn Fn(String) + Send + Sync>>,
     ) -> Result<String, anyhow::Error> {
-        self.process_message_inner(session_id, text, true, on_progress)
+        self.process_message_inner(session_id, text, true, on_chunk, on_progress)
             .await
     }
 
@@ -299,8 +386,56 @@ impl Conductor {
         session_id: &str,
         text: &str,
         is_group: bool,
+        on_chunk: Option<OnStreamChunk>,
         on_progress: Option<Box<dyn Fn(String) + Send + Sync>>,
     ) -> Result<String, anyhow::Error> {
+        // LLM judge pre-check: if the sync filter will flag for LLM judge,
+        // run the judge asynchronously before prompting the agent.
+        if let Some(ref judge) = self.llm_judge {
+            use crate::security::injection::InjectionDetector;
+            // Check if the text would produce the judge marker
+            // by looking at the heuristic score directly
+            let heuristic = crate::security::heuristics::HeuristicScorer::analyze(text);
+            let detector_check = InjectionDetector::new("warn", &self.injection_extra_patterns);
+            let has_pattern = detector_check.analyze_patterns(text).is_some();
+
+            if !has_pattern
+                && heuristic.score >= self.injection_llm_judge_threshold
+                && heuristic.score < self.injection_heuristic_threshold
+            {
+                tracing::info!(
+                    "Running LLM judge for borderline message (heuristic score: {:.2})",
+                    heuristic.score
+                );
+                let verdict = judge.classify(text).await;
+                match verdict {
+                    crate::security::llm_judge::JudgeVerdict::Injection => {
+                        let _ = self
+                            .db
+                            .audit_log(
+                                Some(session_id),
+                                "input_rejected",
+                                None,
+                                Some(&format!(
+                                    "LLM judge classified as INJECTION (heuristic score: {:.2})",
+                                    heuristic.score
+                                )),
+                                0,
+                            )
+                            .await;
+                        self.group_catchup_prefix.clear();
+                        return Ok("I can't process that message.".to_string());
+                    }
+                    crate::security::llm_judge::JudgeVerdict::Safe => {
+                        tracing::debug!("LLM judge classified as SAFE");
+                    }
+                    crate::security::llm_judge::JudgeVerdict::Uncertain => {
+                        tracing::debug!("LLM judge uncertain — proceeding with caution");
+                    }
+                }
+            }
+        }
+
         // Switch session if needed
         if self.current_session != session_id {
             self.switch_session(session_id, is_group).await?;
@@ -309,8 +444,8 @@ impl Conductor {
         // Run the agent
         let rx = self.agent.prompt(text).await;
 
-        // Drain events and collect response
-        let result = drain_response(rx, on_progress).await;
+        // Stream events and collect response
+        let result = stream_response(rx, on_chunk, on_progress).await;
 
         // Audit log if input was rejected (e.g. by injection detector)
         if let Some(ref reason) = result.input_rejected {
@@ -492,23 +627,38 @@ fn catchup_messages(messages: Vec<AgentMessage>, max_messages: usize) -> Vec<Age
     }
 }
 
-/// Result of draining an agent event stream.
-struct DrainResult {
+/// Result of streaming/draining an agent event stream.
+struct StreamResult {
     response: String,
     /// If input was rejected by a filter (e.g. injection detection).
     input_rejected: Option<String>,
 }
 
-/// Drain an AgentEvent receiver and return the final response text.
-/// ProgressMessage events are forwarded via the optional callback.
-async fn drain_response(
+/// Stream agent events: forwards text deltas via `on_chunk` and progress via `on_progress`.
+/// Returns the final response text.
+async fn stream_response(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    on_chunk: Option<OnStreamChunk>,
     on_progress: Option<Box<dyn Fn(String) + Send + Sync>>,
-) -> DrainResult {
+) -> StreamResult {
     let mut response = String::new();
     let mut input_rejected = None;
+    let mut accumulated = String::new();
     while let Some(event) = rx.recv().await {
         match event {
+            AgentEvent::MessageUpdate {
+                delta: StreamDelta::Text { ref delta },
+                ..
+            } => {
+                accumulated.push_str(delta);
+                if let Some(ref cb) = on_chunk {
+                    cb(&accumulated);
+                }
+            }
+            AgentEvent::TurnStart => {
+                // Reset accumulated buffer for multi-turn (tool calls between text)
+                accumulated.clear();
+            }
             AgentEvent::ProgressMessage { text, .. } => {
                 if let Some(ref cb) = on_progress {
                     cb(text);
@@ -537,7 +687,7 @@ async fn drain_response(
             _ => {}
         }
     }
-    DrainResult {
+    StreamResult {
         response,
         input_rejected,
     }
@@ -624,6 +774,10 @@ api_key = "test-key"
             direct_workers: HashMap::new(),
             max_group_catchup: 50,
             group_catchup_prefix: Vec::new(),
+            llm_judge: None,
+            injection_heuristic_threshold: 0.6,
+            injection_llm_judge_threshold: 0.4,
+            injection_extra_patterns: vec![],
         };
 
         (conductor, db)
@@ -633,7 +787,7 @@ api_key = "test-key"
     async fn test_process_message() {
         let (mut conductor, _db) = test_conductor("Hello! How can I help?").await;
         let response = conductor
-            .process_message("test-session", "Hi there", None)
+            .process_message("test-session", "Hi there", None, None)
             .await
             .unwrap();
         assert_eq!(response, "Hello! How can I help?");
@@ -668,11 +822,15 @@ api_key = "test-key"
             direct_workers: HashMap::new(),
             max_group_catchup: 50,
             group_catchup_prefix: Vec::new(),
+            llm_judge: None,
+            injection_heuristic_threshold: 0.6,
+            injection_llm_judge_threshold: 0.4,
+            injection_extra_patterns: vec![],
         };
 
         // Send a message
         conductor
-            .process_message("s1", "Hello", None)
+            .process_message("s1", "Hello", None, None)
             .await
             .unwrap();
 
@@ -795,17 +953,21 @@ api_key = "test-key"
             direct_workers: HashMap::new(),
             max_group_catchup: 50,
             group_catchup_prefix: Vec::new(),
+            llm_judge: None,
+            injection_heuristic_threshold: 0.6,
+            injection_llm_judge_threshold: 0.4,
+            injection_extra_patterns: vec![],
         };
 
         let response = conductor
-            .process_group_message("group-session", "new msg 3", None)
+            .process_group_message("group-session", "new msg 3", None, None)
             .await
             .unwrap();
         assert_eq!(response, "Group response");
     }
 
     #[tokio::test]
-    async fn test_drain_response_forwards_progress() {
+    async fn test_stream_response_forwards_progress() {
         use tokio::sync::mpsc;
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -839,11 +1001,151 @@ api_key = "test-key"
         .unwrap();
         drop(tx);
 
-        let result = drain_response(rx, Some(on_progress)).await;
+        let result = stream_response(rx, None, Some(on_progress)).await;
         assert_eq!(result.response, "Final response");
         assert!(result.input_rejected.is_none());
         let captured = progress_msgs.lock().unwrap();
         assert_eq!(&*captured, &["Step 1 done"]);
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_forwards_chunks() {
+        use tokio::sync::mpsc;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chunks_clone = chunks.clone();
+
+        let on_chunk: OnStreamChunk = Box::new(move |accumulated: &str| {
+            chunks_clone.lock().unwrap().push(accumulated.to_string());
+        });
+
+        // Simulate streaming text deltas
+        tx.send(AgentEvent::MessageUpdate {
+            message: AgentMessage::Llm(Message::Assistant {
+                content: vec![],
+                stop_reason: StopReason::Stop,
+                model: "mock".to_string(),
+                provider: "mock".to_string(),
+                usage: Usage::default(),
+                timestamp: 0,
+                error_message: None,
+            }),
+            delta: StreamDelta::Text {
+                delta: "Hello".to_string(),
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::MessageUpdate {
+            message: AgentMessage::Llm(Message::Assistant {
+                content: vec![],
+                stop_reason: StopReason::Stop,
+                model: "mock".to_string(),
+                provider: "mock".to_string(),
+                usage: Usage::default(),
+                timestamp: 0,
+                error_message: None,
+            }),
+            delta: StreamDelta::Text {
+                delta: " World".to_string(),
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::AgentEnd {
+            messages: vec![AgentMessage::Llm(Message::Assistant {
+                content: vec![Content::Text {
+                    text: "Hello World".to_string(),
+                }],
+                stop_reason: StopReason::Stop,
+                model: "mock".to_string(),
+                provider: "mock".to_string(),
+                usage: Usage::default(),
+                timestamp: 0,
+                error_message: None,
+            })],
+        })
+        .unwrap();
+        drop(tx);
+
+        let result = stream_response(rx, Some(on_chunk), None).await;
+        assert_eq!(result.response, "Hello World");
+        let captured = chunks.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0], "Hello");
+        assert_eq!(captured[1], "Hello World");
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_multi_turn_resets() {
+        use tokio::sync::mpsc;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chunks_clone = chunks.clone();
+
+        let on_chunk: OnStreamChunk = Box::new(move |accumulated: &str| {
+            chunks_clone.lock().unwrap().push(accumulated.to_string());
+        });
+
+        // First turn text
+        tx.send(AgentEvent::MessageUpdate {
+            message: AgentMessage::Llm(Message::Assistant {
+                content: vec![],
+                stop_reason: StopReason::Stop,
+                model: "mock".to_string(),
+                provider: "mock".to_string(),
+                usage: Usage::default(),
+                timestamp: 0,
+                error_message: None,
+            }),
+            delta: StreamDelta::Text {
+                delta: "Part1".to_string(),
+            },
+        })
+        .unwrap();
+
+        // Tool call causes TurnStart (buffer resets)
+        tx.send(AgentEvent::TurnStart).unwrap();
+
+        // Second turn text
+        tx.send(AgentEvent::MessageUpdate {
+            message: AgentMessage::Llm(Message::Assistant {
+                content: vec![],
+                stop_reason: StopReason::Stop,
+                model: "mock".to_string(),
+                provider: "mock".to_string(),
+                usage: Usage::default(),
+                timestamp: 0,
+                error_message: None,
+            }),
+            delta: StreamDelta::Text {
+                delta: "Part2".to_string(),
+            },
+        })
+        .unwrap();
+
+        tx.send(AgentEvent::AgentEnd {
+            messages: vec![AgentMessage::Llm(Message::Assistant {
+                content: vec![Content::Text {
+                    text: "Part2".to_string(),
+                }],
+                stop_reason: StopReason::Stop,
+                model: "mock".to_string(),
+                provider: "mock".to_string(),
+                usage: Usage::default(),
+                timestamp: 0,
+                error_message: None,
+            })],
+        })
+        .unwrap();
+        drop(tx);
+
+        let result = stream_response(rx, Some(on_chunk), None).await;
+        assert_eq!(result.response, "Part2");
+        let captured = chunks.lock().unwrap();
+        // Part1 accumulated, then reset, then Part2 accumulated
+        assert_eq!(captured[0], "Part1");
+        assert_eq!(captured[1], "Part2"); // After reset, starts fresh
     }
 
     #[tokio::test]
@@ -908,11 +1210,15 @@ api_key = "test-key"
             direct_workers: HashMap::new(),
             max_group_catchup: 50,
             group_catchup_prefix: Vec::new(),
+            llm_judge: None,
+            injection_heuristic_threshold: 0.6,
+            injection_llm_judge_threshold: 0.4,
+            injection_extra_patterns: vec![],
         };
 
         // Process a group message — should use catchup slicing
         conductor
-            .process_group_message("group-full", "another msg", None)
+            .process_group_message("group-full", "another msg", None, None)
             .await
             .unwrap();
 

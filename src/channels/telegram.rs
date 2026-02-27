@@ -1,4 +1,4 @@
-use super::{split_message, ChannelAdapter, IncomingMessage, OutgoingMessage};
+use super::{split_message, ChannelAdapter, IncomingMessage, OutgoingMessage, SentMessage};
 use crate::config::TelegramConfig;
 use crate::db::now_ms;
 use async_trait::async_trait;
@@ -100,5 +100,68 @@ impl ChannelAdapter for TelegramAdapter {
                 tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             }
         }))
+    }
+
+    async fn send_placeholder(&self, session_id: &str, text: &str) -> Option<SentMessage> {
+        let chat_id: i64 = session_id
+            .strip_prefix("tg-")
+            .and_then(|s| s.parse().ok())?;
+        match self.bot.send_message(ChatId(chat_id), text).await {
+            Ok(msg) => Some(SentMessage {
+                channel: "telegram".into(),
+                session_id: session_id.to_string(),
+                message_id: msg.id.0.to_string(),
+            }),
+            Err(e) => {
+                tracing::warn!("Failed to send placeholder: {}", e);
+                None
+            }
+        }
+    }
+
+    async fn edit_message(
+        &self,
+        handle: &SentMessage,
+        new_text: &str,
+    ) -> Result<(), anyhow::Error> {
+        let chat_id: i64 = handle
+            .session_id
+            .strip_prefix("tg-")
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("Invalid telegram session_id"))?;
+        let message_id: i32 = handle
+            .message_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid telegram message_id"))?;
+
+        // Telegram max message length is 4096 — truncate if needed
+        let text = if new_text.len() > 4096 {
+            let mut end = 4096;
+            while end > 0 && !new_text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &new_text[..end]
+        } else {
+            new_text
+        };
+
+        // Telegram rejects edits with identical text (400 error) — just ignore
+        match self
+            .bot
+            .edit_message_text(
+                ChatId(chat_id),
+                teloxide::types::MessageId(message_id),
+                text,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(teloxide::RequestError::Api(ref e))
+                if e.to_string().contains("message is not modified") =>
+            {
+                Ok(()) // Silently ignore identical-text edits
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }

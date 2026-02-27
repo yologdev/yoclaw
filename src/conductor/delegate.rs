@@ -92,7 +92,7 @@ pub fn build_workers(
 }
 
 /// Resolve a provider name to an Arc<dyn StreamProvider>.
-fn resolve_arc_provider(name: &str) -> Arc<dyn StreamProvider> {
+pub(crate) fn resolve_arc_provider(name: &str) -> Arc<dyn StreamProvider> {
     use yoagent::provider::*;
     match name {
         "anthropic" => Arc::new(AnthropicProvider),
